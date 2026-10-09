@@ -10,6 +10,7 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.passive.VillagerEntity;
+import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.network.packet.c2s.play.SelectMerchantTradeC2SPacket;
@@ -19,11 +20,11 @@ import net.minecraft.screen.ScreenHandler;
 import net.minecraft.screen.slot.Slot;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.text.Text;
+import net.minecraft.util.ActionResult;
 import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.EntityHitResult;
 import net.minecraft.util.hit.HitResult;
-import net.minecraft.entity.projectile.ProjectileUtil;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.MathHelper;
@@ -33,6 +34,8 @@ import net.minecraft.village.TradeOfferList;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Properties;
 import java.util.Random;
 import java.util.UUID;
@@ -46,13 +49,13 @@ public class ArbuzBot implements ClientModInitializer {
 
     // --- konfiguracja (zapisywana w config/arbuzbot.properties) ---
     BlockPos chest, outChest;
-    UUID vEme, vXp;
+    final List<UUID> vEme = new ArrayList<>(), vXp = new ArrayList<>();
     static final Path CFG = FabricLoader.getInstance().getConfigDir().resolve("arbuzbot.properties");
 
     // --- stan ---
     final Random R = new Random();
     S s = S.IDLE;
-    int delay, waited, taken, trades, step, emptyTicks, vIdx;
+    int delay, waited, taken, trades, step, emptyTicks, vIdx, vPos, quota, used, attempts;
     boolean counted;
     String homeName = "Domek #1";
     S afterHome = S.AIM_V;
@@ -67,8 +70,15 @@ public class ArbuzBot implements ClientModInitializer {
             d.register(literal("arbuz-skrzynia-odluz").executes(c -> setBlock(c, 1)));
             d.register(literal("arbuz-villager-eme").executes(c -> setVillager(c, 0)));
             d.register(literal("arbuz-villager-xp").executes(c -> setVillager(c, 1)));
+            d.register(literal("arbuz-villager-eme-clear").executes(c -> { vEme.clear(); save(); c.getSource().sendFeedback(Text.literal("[Arbuz] Wyczyszczono liste villagerow eme.")); return 1; }));
+            d.register(literal("arbuz-villager-xp-clear").executes(c -> { vXp.clear(); save(); c.getSource().sendFeedback(Text.literal("[Arbuz] Wyczyszczono liste villagerow xp.")); return 1; }));
+            d.register(literal("arbuz-status").executes(c -> {
+                c.getSource().sendFeedback(Text.literal("[Arbuz] skrzynia: " + (chest != null) + ", odluz: " + (outChest != null)
+                        + ", villagerzy eme: " + vEme.size() + ", villagerzy xp: " + vXp.size() + ", stan: " + s));
+                return 1;
+            }));
             d.register(literal("arbuz-start").executes(c -> {
-                if (chest == null || outChest == null || vEme == null || vXp == null) {
+                if (chest == null || outChest == null || vEme.isEmpty() || vXp.isEmpty()) {
                     c.getSource().sendFeedback(Text.literal("[Arbuz] Najpierw zaznacz: skrzynia, skrzynia-odluz, villager-eme, villager-xp"));
                     return 0;
                 }
@@ -78,7 +88,7 @@ public class ArbuzBot implements ClientModInitializer {
                 c.getSource().sendFeedback(Text.literal("[Arbuz] Start. Czekam na 5 stakow arbuzow w skrzynce."));
                 return 1;
             }));
-            d.register(literal("arbuz-stop").executes(c -> { s = S.IDLE; c.getSource().sendFeedback(Text.literal("[Arbuz] Stop.")); return 1; }));
+            d.register(literal("arbuz-stop").executes(c -> { s = S.IDLE; walk(false); c.getSource().sendFeedback(Text.literal("[Arbuz] Stop.")); return 1; }));
         });
     }
 
@@ -98,9 +108,14 @@ public class ArbuzBot implements ClientModInitializer {
     int setVillager(CommandContext<FabricClientCommandSource> c, int which) {
         MinecraftClient mc = c.getSource().getClient();
         if (mc.crosshairTarget instanceof EntityHitResult e && e.getEntity() instanceof VillagerEntity v) {
-            if (which == 0) vEme = v.getUuid(); else vXp = v.getUuid();
+            List<UUID> list = which == 0 ? vEme : vXp;
+            if (list.contains(v.getUuid())) {
+                c.getSource().sendFeedback(Text.literal("[Arbuz] Ten villager jest juz na liscie."));
+                return 0;
+            }
+            list.add(v.getUuid());
             save();
-            c.getSource().sendFeedback(Text.literal("[Arbuz] Zapisano villagera (" + (which == 0 ? "emeraldy" : "xp") + ")"));
+            c.getSource().sendFeedback(Text.literal("[Arbuz] Dodano villagera (" + (which == 0 ? "emeraldy" : "xp") + "), razem: " + list.size()));
             return 1;
         }
         c.getSource().sendFeedback(Text.literal("[Arbuz] Patrz na villagera!"));
@@ -146,7 +161,7 @@ public class ArbuzBot implements ClientModInitializer {
                         delay = 3 + R.nextInt(7);
                         if (taken >= 5) {
                             p.closeHandledScreen();
-                            homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0;
+                            homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0; vPos = 0; attempts = 0;
                             go(S.HOME_CMD, 10, 30);
                         }
                         return;
@@ -154,7 +169,7 @@ public class ArbuzBot implements ClientModInitializer {
                 }
                 // brak wiecej arbuzow do wziecia
                 p.closeHandledScreen();
-                homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0;
+                homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0; vPos = 0; attempts = 0;
                 go(S.HOME_CMD, 10, 30);
             }
             case HOME_CMD -> {
@@ -184,30 +199,51 @@ public class ArbuzBot implements ClientModInitializer {
                 }
             }
             case AIM_V -> {
-                Entity v = find(mc, vIdx == 0 ? vEme : vXp);
-                if (v == null) { if (waited > 100) fail("Nie widze villagera."); return; }
-                if (p.getEyePos().distanceTo(v.getBoundingBox().getCenter()) > 3.2) { fail("Za daleko od villagera."); return; }
-                aim(p, v.getBoundingBox().getCenter().add(jitter.multiply(0.4)));
-                EntityHitResult eh = rayEntity(p);
-                if (eh != null && eh.getEntity() == v) {
-                    mc.interactionManager.interactEntity(p, v, Hand.MAIN_HAND);
+                List<UUID> grp = group();
+                if (vPos >= grp.size()) { nextVillager(); return; }
+                Entity v = find(mc, grp.get(vPos));
+                if (v == null) {
+                    if (waited > 100) { msg("Nie widze villagera #" + (vPos + 1) + " - pomijam."); nextVillager(); }
+                    return;
+                }
+                Box bb = v.getBoundingBox();
+                Vec3d eye = p.getEyePos();
+                Vec3d near = new Vec3d(MathHelper.clamp(eye.x, bb.minX, bb.maxX), MathHelper.clamp(eye.y, bb.minY, bb.maxY), MathHelper.clamp(eye.z, bb.minZ, bb.maxZ));
+                double dist = eye.distanceTo(near);
+                if (dist > 7) { walk(false); msg("Villager #" + (vPos + 1) + " za daleko (" + String.format("%.1f", dist) + " m) - pomijam."); nextVillager(); return; }
+                walk(dist > 2.5);
+                boolean aimed = aim(p, bb.getCenter().add(jitter.multiply(0.3)));
+                if (aimed && dist <= 2.9) {
+                    walk(false);
+                    int have = p.getInventory().count(inputItem());
+                    if (have <= 0) { msg("Brak przedmiotow do wymiany - pomijam."); nextVillager(); return; }
+                    quota = (int) Math.ceil(have / (double) (grp.size() - vPos)); // podzial po rowno
+                    used = 0; trades = 0; step = 0; emptyTicks = 0; attempts++;
+                    EntityHitResult hit = new EntityHitResult(v, bb.getCenter());
+                    ActionResult r = mc.interactionManager.interactEntityAtLocation(p, v, hit, Hand.MAIN_HAND);
+                    if (!r.isAccepted()) mc.interactionManager.interactEntity(p, v, Hand.MAIN_HAND);
                     p.swingHand(Hand.MAIN_HAND);
-                    trades = 0; step = 0; emptyTicks = 0;
                     go(S.TRADE, 10, 20);
                 }
             }
             case TRADE -> {
-                if (!(h instanceof MerchantScreenHandler m)) { if (waited > 60) go(S.AIM_V, 5, 15); return; }
+                if (!(h instanceof MerchantScreenHandler m)) {
+                    if (waited > 60) {
+                        if (attempts >= 4) { msg("Villager #" + (vPos + 1) + " sie nie otwiera (brak zawodu / spi?) - pomijam."); nextVillager(); }
+                        else go(S.AIM_V, 5, 15);
+                    }
+                    return;
+                }
                 TradeOfferList offers = m.getRecipes();
                 int idx = findOffer(offers);
-                if (idx < 0) { fail("Villager nie ma odpowiedniej wymiany."); return; }
+                if (idx < 0) { msg("Villager #" + (vPos + 1) + " nie ma odpowiedniej wymiany - pomijam."); p.closeHandledScreen(); nextVillager(); return; }
                 TradeOffer o = offers.get(idx);
                 ItemStack buy = o.getDisplayedFirstBuyItem();
-                boolean done = o.isDisabled() || p.getInventory().count(buy.getItem()) < buy.getCount() || trades >= 400;
+                boolean done = o.isDisabled() || used >= quota || p.getInventory().count(buy.getItem()) < buy.getCount() || trades >= 600;
                 if (done) {
-                    msg("Wymieniono " + trades + "x (villager " + (vIdx == 0 ? "eme" : "xp") + ").");
+                    msg("Villager #" + (vPos + 1) + " (" + (vIdx == 0 ? "eme" : "xp") + "): " + trades + " wymian.");
                     p.closeHandledScreen();
-                    if (vIdx == 0) { vIdx = 1; go(S.AIM_V, 15, 40); } else go(S.AIM_OUT, 15, 40);
+                    nextVillager();
                     return;
                 }
                 if (step == 0) {
@@ -219,7 +255,7 @@ public class ArbuzBot implements ClientModInitializer {
                     ItemStack out = m.getSlot(2).getStack();
                     if (!out.isEmpty()) {
                         mc.interactionManager.clickSlot(m.syncId, 2, 0, SlotActionType.QUICK_MOVE, p);
-                        trades++; step = 0; waited = 0;
+                        trades++; used += buy.getCount(); step = 0; waited = 0;
                         delay = 4 + R.nextInt(8);
                     } else {
                         if (++emptyTicks > 8) { step = 0; emptyTicks = 0; }
@@ -250,16 +286,33 @@ public class ArbuzBot implements ClientModInitializer {
 
     // ================= pomocnicze =================
     void go(S next, int minD, int maxD) {
-        s = next; waited = 0;
+        s = next; waited = 0; walk(false);
         delay = minD + R.nextInt(Math.max(1, maxD - minD + 1));
         jitter = new Vec3d((R.nextDouble() - .5) * .5, (R.nextDouble() - .5) * .5, (R.nextDouble() - .5) * .5);
     }
 
-    void fail(String m) { s = S.IDLE; msg("BLAD: " + m); }
+    void fail(String m) { s = S.IDLE; walk(false); msg("BLAD: " + m); }
 
     void msg(String m) {
         MinecraftClient mc = MinecraftClient.getInstance();
         if (mc.player != null) mc.player.sendMessage(Text.literal("[Arbuz] " + m), false);
+    }
+
+    List<UUID> group() { return vIdx == 0 ? vEme : vXp; }
+
+    Item inputItem() { return vIdx == 0 ? Items.MELON : Items.EMERALD; }
+
+    void walk(boolean on) {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.options != null) mc.options.forwardKey.setPressed(on);
+    }
+
+    /** Przechodzi do nastepnego villagera, potem do drugiej grupy, na koncu do skrzynki z butelkami. */
+    void nextVillager() {
+        vPos++; attempts = 0;
+        if (vPos < group().size()) { go(S.AIM_V, 15, 40); return; }
+        if (vIdx == 0) { vIdx = 1; vPos = 0; go(S.AIM_V, 15, 40); return; }
+        go(S.AIM_OUT, 15, 40);
     }
 
     boolean isFullMelon(ItemStack st) { return st.isOf(Items.MELON) && st.getCount() >= st.getMaxCount(); }
@@ -297,15 +350,8 @@ public class ArbuzBot implements ClientModInitializer {
         return false;
     }
 
-    EntityHitResult rayEntity(ClientPlayerEntity p) {
-        Vec3d start = p.getEyePos();
-        Vec3d dir = p.getRotationVec(1.0f).multiply(3.0);
-        Box box = p.getBoundingBox().stretch(dir).expand(1.0);
-        return ProjectileUtil.raycast(p, start, start.add(dir), box, e -> !e.isSpectator() && e.canHit(), 9.0);
-    }
-
     /** Ludzki ruch myszka: latwiejszy start/koniec, losowa predkosc, drobny szum. */
-    void aim(ClientPlayerEntity p, Vec3d t) {
+    boolean aim(ClientPlayerEntity p, Vec3d t) {
         Vec3d e = p.getEyePos();
         double dx = t.x - e.x, dy = t.y - e.y, dz = t.z - e.z;
         float ty = (float) (MathHelper.atan2(dz, dx) * 57.29577951) - 90f;
@@ -317,8 +363,10 @@ public class ArbuzBot implements ClientModInitializer {
         if (Math.abs(dyaw) > 1.2f && Math.abs(sy) < 0.4f) sy = Math.copySign(0.4f, dyaw);
         if (Math.abs(dpit) > 1.2f && Math.abs(sp) < 0.4f) sp = Math.copySign(0.4f, dpit);
         float n = (Math.abs(dyaw) > 2 || Math.abs(dpit) > 2) ? (R.nextFloat() - .5f) * 0.3f : 0f;
+        boolean ok = Math.abs(dyaw) < 2f && Math.abs(dpit) < 2f;
         p.setYaw(p.getYaw() + sy + n);
         p.setPitch(MathHelper.clamp(p.getPitch() + sp + n, -90f, 90f));
+        return ok;
     }
 
     // ================= zapis konfiguracji =================
@@ -327,10 +375,24 @@ public class ArbuzBot implements ClientModInitializer {
             Properties pr = new Properties();
             if (chest != null) pr.setProperty("chest", chest.asLong() + "");
             if (outChest != null) pr.setProperty("outChest", outChest.asLong() + "");
-            if (vEme != null) pr.setProperty("vEme", vEme.toString());
-            if (vXp != null) pr.setProperty("vXp", vXp.toString());
+            pr.setProperty("vEme", join(vEme));
+            pr.setProperty("vXp", join(vXp));
             try (var w = Files.newBufferedWriter(CFG)) { pr.store(w, "ArbuzBot"); }
         } catch (Exception ignored) {}
+    }
+
+    static String join(List<UUID> l) {
+        StringBuilder sb = new StringBuilder();
+        for (UUID u : l) { if (sb.length() > 0) sb.append(','); sb.append(u); }
+        return sb.toString();
+    }
+
+    static void parse(String s, List<UUID> out) {
+        out.clear();
+        for (String part : s.split(",")) {
+            if (part.isBlank()) continue;
+            try { out.add(UUID.fromString(part.trim())); } catch (Exception ignored) {}
+        }
     }
 
     void load() {
@@ -340,8 +402,8 @@ public class ArbuzBot implements ClientModInitializer {
             try (var r = Files.newBufferedReader(CFG)) { pr.load(r); }
             if (pr.containsKey("chest")) chest = BlockPos.fromLong(Long.parseLong(pr.getProperty("chest")));
             if (pr.containsKey("outChest")) outChest = BlockPos.fromLong(Long.parseLong(pr.getProperty("outChest")));
-            if (pr.containsKey("vEme")) vEme = UUID.fromString(pr.getProperty("vEme"));
-            if (pr.containsKey("vXp")) vXp = UUID.fromString(pr.getProperty("vXp"));
+            parse(pr.getProperty("vEme", ""), vEme);
+            parse(pr.getProperty("vXp", ""), vXp);
         } catch (Exception ignored) {}
     }
 }
