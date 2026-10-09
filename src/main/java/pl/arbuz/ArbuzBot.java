@@ -31,6 +31,7 @@ import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.village.TradeOffer;
 import net.minecraft.village.TradeOfferList;
+import net.minecraft.world.RaycastContext;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -53,13 +54,16 @@ public class ArbuzBot implements ClientModInitializer {
     static final Path CFG = FabricLoader.getInstance().getConfigDir().resolve("arbuzbot.properties");
 
     // --- stan ---
+    static final double MAX_WALK = 30.0; // max dystans chodzenia (m)
     final Random R = new Random();
     S s = S.IDLE;
     int delay, waited, taken, trades, step, emptyTicks, vIdx, vPos, quota, used, attempts;
     boolean counted;
     String homeName = "Domek #1";
     S afterHome = S.AIM_V;
-    Vec3d startPos = Vec3d.ZERO, jitter = Vec3d.ZERO;
+    Vec3d startPos = Vec3d.ZERO, jitter = Vec3d.ZERO, homePos = Vec3d.ZERO;
+    boolean blocked;   // ktorys villager nie sprzedawal w tej rundzie
+    int lastBuy = 1;   // ile sztuk kosztuje jedna wymiana
 
     @Override
     public void onInitializeClient() {
@@ -161,7 +165,7 @@ public class ArbuzBot implements ClientModInitializer {
                         delay = 3 + R.nextInt(7);
                         if (taken >= 5) {
                             p.closeHandledScreen();
-                            homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0; vPos = 0; attempts = 0;
+                            homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0; vPos = 0; attempts = 0; blocked = false;
                             go(S.HOME_CMD, 10, 30);
                         }
                         return;
@@ -169,7 +173,7 @@ public class ArbuzBot implements ClientModInitializer {
                 }
                 // brak wiecej arbuzow do wziecia
                 p.closeHandledScreen();
-                homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0; vPos = 0; attempts = 0;
+                homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0; vPos = 0; attempts = 0; blocked = false;
                 go(S.HOME_CMD, 10, 30);
             }
             case HOME_CMD -> {
@@ -195,6 +199,7 @@ public class ArbuzBot implements ClientModInitializer {
                 if (p.getPos().distanceTo(startPos) > 6) {
                     if (afterHome == S.DONE) { s = S.DONE; msg("Gotowe - jestem na " + homeName + "."); return; }
                     if (h != p.playerScreenHandler) p.closeHandledScreen();
+                    homePos = p.getPos();
                     go(afterHome, 40, 90); // czekanie na zaladowanie chunkow
                 }
             }
@@ -210,11 +215,21 @@ public class ArbuzBot implements ClientModInitializer {
                 Vec3d eye = p.getEyePos();
                 Vec3d near = new Vec3d(MathHelper.clamp(eye.x, bb.minX, bb.maxX), MathHelper.clamp(eye.y, bb.minY, bb.maxY), MathHelper.clamp(eye.z, bb.minZ, bb.maxZ));
                 double dist = eye.distanceTo(near);
-                if (dist > 7) { walk(false); msg("Villager #" + (vPos + 1) + " za daleko (" + String.format("%.1f", dist) + " m) - pomijam."); nextVillager(); return; }
-                walk(dist > 2.5);
+                if (bb.getCenter().distanceTo(homePos) > MAX_WALK || dist > MAX_WALK) {
+                    msg("Villager #" + (vPos + 1) + " dalej niz " + (int) MAX_WALK + " m - pomijam."); nextVillager(); return;
+                }
+                if (p.getPos().distanceTo(homePos) > MAX_WALK + 2) {
+                    msg("Wyszedlem poza " + (int) MAX_WALK + " m - pomijam villagera #" + (vPos + 1) + "."); nextVillager(); return;
+                }
+                if (waited > 500) {
+                    msg("Nie moge dojsc do villagera #" + (vPos + 1) + " (sciana / przeszkoda?) - pomijam."); nextVillager(); return;
+                }
+                boolean los = visible(mc, p, v);            // czy widze villagera (bez scian)
+                boolean walkOn = (!los && dist > 0.8) || dist > 2.3;
+                moveTo(mc, p, walkOn);
                 boolean aimed = aim(p, bb.getCenter().add(jitter.multiply(0.3)));
-                if (aimed && dist <= 2.9) {
-                    walk(false);
+                if (aimed && los && dist <= 2.9) {
+                    moveTo(mc, p, false);
                     int have = p.getInventory().count(inputItem());
                     if (have <= 0) { msg("Brak przedmiotow do wymiany - pomijam."); nextVillager(); return; }
                     quota = (int) Math.ceil(have / (double) (grp.size() - vPos)); // podzial po rowno
@@ -236,9 +251,11 @@ public class ArbuzBot implements ClientModInitializer {
                 }
                 TradeOfferList offers = m.getRecipes();
                 int idx = findOffer(offers);
-                if (idx < 0) { msg("Villager #" + (vPos + 1) + " nie ma odpowiedniej wymiany - pomijam."); p.closeHandledScreen(); nextVillager(); return; }
+                if (idx < 0) { msg("Villager #" + (vPos + 1) + " nie ma jeszcze tej wymiany - wroce do niego pozniej."); blocked = true; p.closeHandledScreen(); nextVillager(); return; }
                 TradeOffer o = offers.get(idx);
                 ItemStack buy = o.getDisplayedFirstBuyItem();
+                lastBuy = Math.max(1, buy.getCount());
+                if (o.isDisabled() && used < quota) blocked = true; // wyprzedany - wroce po restocku
                 boolean done = o.isDisabled() || used >= quota || p.getInventory().count(buy.getItem()) < buy.getCount() || trades >= 600;
                 if (done) {
                     msg("Villager #" + (vPos + 1) + " (" + (vIdx == 0 ? "eme" : "xp") + "): " + trades + " wymian.");
@@ -304,15 +321,38 @@ public class ArbuzBot implements ClientModInitializer {
 
     void walk(boolean on) {
         MinecraftClient mc = MinecraftClient.getInstance();
-        if (mc.options != null) mc.options.forwardKey.setPressed(on);
+        if (mc.options != null) { mc.options.forwardKey.setPressed(on); if (!on) mc.options.jumpKey.setPressed(false); }
     }
 
-    /** Przechodzi do nastepnego villagera, potem do drugiej grupy, na koncu do skrzynki z butelkami. */
+    /** Nastepny villager; po ostatniej wymianie sprawdza czy trzeba czekac na restock. */
     void nextVillager() {
+        MinecraftClient mc = MinecraftClient.getInstance();
         vPos++; attempts = 0;
         if (vPos < group().size()) { go(S.AIM_V, 15, 40); return; }
-        if (vIdx == 0) { vIdx = 1; vPos = 0; go(S.AIM_V, 15, 40); return; }
+        if (blocked && mc.player != null && mc.player.getInventory().count(inputItem()) >= lastBuy) {
+            blocked = false; vPos = 0;
+            msg("Villagerzy nie sprzedaja - czekam na restock i wracam do pracy. (/arbuz-stop zeby przerwac)");
+            go(S.AIM_V, 600, 1200); // sprawdz ponownie za 30-60 s
+            return;
+        }
+        if (vIdx == 0) { vIdx = 1; vPos = 0; blocked = false; go(S.AIM_V, 15, 40); return; }
         go(S.AIM_OUT, 15, 40);
+    }
+
+    /** Czy miedzy mna a villagerem nie ma bloku (zeby nie otwierac przez sciane). */
+    boolean visible(MinecraftClient mc, ClientPlayerEntity p, Entity v) {
+        Vec3d eye = p.getEyePos();
+        for (Vec3d t : new Vec3d[]{v.getEyePos(), v.getBoundingBox().getCenter()}) {
+            BlockHitResult r = mc.world.raycast(new RaycastContext(eye, t, RaycastContext.ShapeType.OUTLINE, RaycastContext.FluidHandling.NONE, p));
+            if (r.getType() == HitResult.Type.MISS || r.getPos().distanceTo(eye) >= eye.distanceTo(t) - 0.25) return true;
+        }
+        return false;
+    }
+
+    /** Ruch do przodu; przy przeszkodzie (kolizja) skacze jak gracz. */
+    void moveTo(MinecraftClient mc, ClientPlayerEntity p, boolean forward) {
+        mc.options.forwardKey.setPressed(forward);
+        mc.options.jumpKey.setPressed(forward && p.horizontalCollision && p.isOnGround());
     }
 
     boolean isFullMelon(ItemStack st) { return st.isOf(Items.MELON) && st.getCount() >= st.getMaxCount(); }
@@ -332,16 +372,20 @@ public class ArbuzBot implements ClientModInitializer {
         return -1;
     }
 
-    /** Plynnie celuje w skrzynke i otwiera ja gdy kursor faktycznie na niej jest. */
+    /** Podchodzi do skrzynki (max 30 m), celuje plynnie i otwiera ja gdy faktycznie na nia patrzy. */
     boolean openBlock(MinecraftClient mc, ClientPlayerEntity p, BlockPos pos) {
         Vec3d c = Vec3d.ofCenter(pos);
-        if (p.getEyePos().distanceTo(c) > 5.5) { fail("Za daleko od skrzynki " + pos.toShortString()); return false; }
+        double d = p.getEyePos().distanceTo(c);
+        if (d > MAX_WALK) { fail("Skrzynka " + pos.toShortString() + " dalej niz " + (int) MAX_WALK + " m."); return false; }
+        moveTo(mc, p, d > 4.0);
         aim(p, c.add(jitter.multiply(0.6)));
+        if (d > 4.4) return false;
         HitResult hr = p.raycast(4.5, 1.0f, false);
         if (hr instanceof BlockHitResult b && b.getType() == HitResult.Type.BLOCK) {
             BlockPos bp = b.getBlockPos();
             boolean same = bp.equals(pos) || (mc.world.getBlockState(bp).getBlock() == mc.world.getBlockState(pos).getBlock() && bp.getSquaredDistance(pos) <= 2);
             if (same) {
+                moveTo(mc, p, false);
                 mc.interactionManager.interactBlock(p, Hand.MAIN_HAND, b);
                 p.swingHand(Hand.MAIN_HAND);
                 return true;
