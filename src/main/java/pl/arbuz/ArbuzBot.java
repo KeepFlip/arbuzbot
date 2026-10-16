@@ -230,7 +230,13 @@ public class ArbuzBot implements ClientModInitializer {
             case TP_WAIT -> {
                 if (h != p.playerScreenHandler && waited > 60) p.closeHandledScreen();
                 if (p.getPos().distanceTo(startPos) > 6) {
-                    if (afterHome == S.DONE) { s = S.DONE; msg("Gotowe - jestem na " + homeName + "."); return; }
+                    if (afterHome == S.DONE) {
+                        // jestem na Domek #2 - bot dziala dalej: wraca do skrzynki z arbuzami i czeka na kolejna ture
+                        msg("Jestem na " + homeName + " - czekam na kolejne arbuzy.");
+                        taken = 0; counted = false;
+                        go(S.AIM_CHEST, 40, 90);
+                        return;
+                    }
                     if (h != p.playerScreenHandler) p.closeHandledScreen();
                     homePos = p.getPos();
                     go(afterHome, 40, 90); // czekanie na zaladowanie chunkow
