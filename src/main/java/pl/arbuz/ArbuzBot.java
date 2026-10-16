@@ -67,6 +67,8 @@ public class ArbuzBot implements ClientModInitializer {
 
     // --- stan ---
     static final double MAX_WALK = 30.0; // max dystans chodzenia (m)
+    static final int MELON_TARGET = 320;  // 5 stakow arbuzow
+    int takenTotal, needTotal;
     final Random R = new Random();
     S s = S.IDLE;
     int delay, waited, taken, trades, step, emptyTicks, vIdx, vPos, quota, used, attempts;
@@ -80,8 +82,6 @@ public class ArbuzBot implements ClientModInitializer {
     // --- ucieczka / anty-logout ---
     int antiSec = 30, fleeLeft, fleeRecalc; Vec3d fleeDir;
     boolean blocked;   // ktorys villager nie sprzedawal w tej rundzie
-    boolean meloLeft;  // zostaly arbuzy do sprzedania po rundzie XP
-    static final int MAX_XP_PRICE = 3; // max cena jednej butelki XP w emeraldach
     int lastBuy = 1;   // ile sztuk kosztuje jedna wymiana
 
     @Override
@@ -164,6 +164,12 @@ public class ArbuzBot implements ClientModInitializer {
 
         switch (s) {
             case AIM_CHEST -> {
+                if (p.getInventory().count(Items.MELON) >= MELON_TARGET) {
+                    msg("Mam juz 5 stakow arbuzow w eq.");
+                    homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0; vPos = 0; attempts = 0; blocked = false;
+                    go(S.HOME_CMD, 10, 30);
+                    return;
+                }
                 if (openBlock(mc, p, chest)) { counted = false; taken = 0; go(S.TAKE, 6, 14); }
             }
             case TAKE -> {
@@ -173,32 +179,34 @@ public class ArbuzBot implements ClientModInitializer {
                 }
                 int chestSlots = g.getRows() * 9;
                 if (!counted) {
-                    int n = 0;
-                    for (int i = 0; i < chestSlots; i++) { ItemStack st = g.getSlot(i).getStack(); if (isFullMelon(st)) n++; }
+                    int have = p.getInventory().count(Items.MELON);          // reszta arbuzow z poprzedniej tury tez sie liczy
+                    needTotal = MELON_TARGET - have; takenTotal = 0;
+                    int sum = 0;
+                    for (int i = 0; i < chestSlots; i++) { ItemStack st = g.getSlot(i).getStack(); if (st.isOf(Items.MELON)) sum += st.getCount(); }
                     counted = true;
-                    if (n < 5) {
+                    if (sum < needTotal) {
                         p.closeHandledScreen();
-                        go(S.AIM_CHEST, 600, 1200); // sprawdz ponownie za 30-60 s
+                        go(S.AIM_CHEST, 600, 1200); // za malo arbuzow - sprawdz ponownie za 30-60 s
                         return;
                     }
-                    msg("Jest 5 stakow arbuzow - biore.");
+                    msg("Mam " + have + " arbuzow, biore " + needTotal + " ze skrzynki (razem 5 stakow).");
                 }
-                for (int i = 0; i < chestSlots; i++) {
-                    if (isFullMelon(g.getSlot(i).getStack())) {
-                        mc.interactionManager.clickSlot(g.syncId, i, 0, SlotActionType.QUICK_MOVE, p);
-                        taken++; waited = 0;
+                if (takenTotal < needTotal) {
+                    int bi = -1, bc = 0;
+                    for (int i = 0; i < chestSlots; i++) {
+                        ItemStack st = g.getSlot(i).getStack();
+                        if (st.isOf(Items.MELON) && st.getCount() > bc) { bi = i; bc = st.getCount(); }
+                    }
+                    if (bi >= 0) {
+                        if (++taken > 20) { fail("Nie moge wziac arbuzow (pelny ekwipunek?)."); return; }
+                        mc.interactionManager.clickSlot(g.syncId, bi, 0, SlotActionType.QUICK_MOVE, p);
+                        takenTotal += bc; waited = 0;
                         delay = 3 + R.nextInt(7);
-                        if (taken >= 5) {
-                            p.closeHandledScreen();
-                            homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0; vPos = 0; attempts = 0; blocked = false; meloLeft = false;
-                            go(S.HOME_CMD, 10, 30);
-                        }
                         return;
                     }
                 }
-                // brak wiecej arbuzow do wziecia
                 p.closeHandledScreen();
-                homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0; vPos = 0; attempts = 0; blocked = false; meloLeft = false;
+                homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0; vPos = 0; attempts = 0; blocked = false;
                 go(S.HOME_CMD, 10, 30);
             }
             case HOME_CMD -> {
@@ -225,7 +233,6 @@ public class ArbuzBot implements ClientModInitializer {
                     if (afterHome == S.DONE) { s = S.DONE; msg("Gotowe - jestem na " + homeName + "."); return; }
                     if (h != p.playerScreenHandler) p.closeHandledScreen();
                     homePos = p.getPos();
-                    if (afterHome == S.AIM_CHEST) { taken = 0; counted = false; msg("Nowa runda - czekam na arbuzy w skrzynce."); }
                     go(afterHome, 40, 90); // czekanie na zaladowanie chunkow
                 }
             }
@@ -262,7 +269,7 @@ public class ArbuzBot implements ClientModInitializer {
                 if (aimed) {
                     int have = p.getInventory().count(inputItem());
                     if (have <= 0) { msg("Brak przedmiotow do wymiany - pomijam."); nextVillager(); return; }
-                    quota = vIdx == 1 ? Integer.MAX_VALUE : (int) Math.ceil(have / (double) (grp.size() - vPos)); // XP: bez limitu ilosci, farmerzy: podzial po rowno
+                    quota = (int) Math.ceil(have / (double) (grp.size() - vPos)); // podzial po rowno
                     used = 0; trades = 0; step = 0; emptyTicks = 0; attempts++;
                     EntityHitResult hit = new EntityHitResult(v, bb.getCenter());
                     ActionResult r = mc.interactionManager.interactEntityAtLocation(p, v, hit, Hand.MAIN_HAND);
@@ -279,23 +286,44 @@ public class ArbuzBot implements ClientModInitializer {
                     }
                     return;
                 }
+                // 1) jesli trzymam przedmiot na kursorze - odloz go do ekwipunku
+                ItemStack cursor = m.getCursorStack();
+                if (!cursor.isEmpty()) {
+                    int target = -1;
+                    for (int i = 3; i < m.slots.size() && target < 0; i++) {
+                        ItemStack st = m.getSlot(i).getStack();
+                        if (st.isOf(cursor.getItem()) && st.getCount() < st.getMaxCount()) target = i;
+                    }
+                    for (int i = 3; i < m.slots.size() && target < 0; i++) if (m.getSlot(i).getStack().isEmpty()) target = i;
+                    if (target < 0) { fail("Pelny ekwipunek."); return; }
+                    mc.interactionManager.clickSlot(m.syncId, target, 0, SlotActionType.PICKUP, p);
+                    waited = 0; delay = 2 + R.nextInt(4);
+                    return;
+                }
                 TradeOfferList offers = m.getRecipes();
                 int idx = findOffer(offers);
                 if (idx < 0) { msg("Villager #" + (vPos + 1) + " nie ma jeszcze tej wymiany - wroce do niego pozniej."); blocked = true; p.closeHandledScreen(); nextVillager(); return; }
                 TradeOffer o = offers.get(idx);
                 ItemStack buy = o.getDisplayedFirstBuyItem();
                 lastBuy = Math.max(1, buy.getCount());
-                if (vIdx == 1 && buy.getCount() > MAX_XP_PRICE) {
-                    msg("Villager #" + (vPos + 1) + ": butelka kosztuje " + buy.getCount() + " eme (max " + MAX_XP_PRICE + ") - pomijam.");
-                    blocked = true; // cena moze spasc po restocku
-                    p.closeHandledScreen(); nextVillager(); return;
-                }
                 if (o.isDisabled() && used < quota) blocked = true; // wyprzedany - wroce po restocku
-                boolean done = o.isDisabled() || used >= quota || p.getInventory().count(buy.getItem()) < buy.getCount() || trades >= 600;
+                // przedmioty wrzucone przez autofill do okienek wymiany tez sie licza (inaczej bot myslal ze nie ma emeraldow)
+                int avail = p.getInventory().count(buy.getItem());
+                for (int i = 0; i < 2; i++) { ItemStack st = m.getSlot(i).getStack(); if (st.isOf(buy.getItem())) avail += st.getCount(); }
+                boolean done = o.isDisabled() || used >= quota || avail < buy.getCount() || trades >= 600;
                 if (done) {
-                    msg("Villager #" + (vPos + 1) + " (" + (vIdx == 0 ? "eme" : "xp") + "): " + trades + " wymian.");
+                    msg("Villager #" + (vPos + 1) + " (" + (vIdx == 0 ? "eme" : "xp") + "): " + trades + " wymian"
+                            + (o.isDisabled() ? " (wyprzedany)" : used >= quota ? " (jego czesc)" : "") + ".");
                     p.closeHandledScreen();
                     nextVillager();
+                    return;
+                }
+                ItemStack out = m.getSlot(2).getStack();
+                if (!out.isEmpty()) {
+                    // jedna wymiana na raz (PICKUP, nie shift-click, bo shift-click wymienia wszystko naraz i omija podzial 50/50)
+                    mc.interactionManager.clickSlot(m.syncId, 2, 0, SlotActionType.PICKUP, p);
+                    trades++; used += buy.getCount(); step = 0; emptyTicks = 0; waited = 0;
+                    delay = 3 + R.nextInt(6);
                     return;
                 }
                 if (step == 0) {
@@ -304,15 +332,8 @@ public class ArbuzBot implements ClientModInitializer {
                     step = 1; emptyTicks = 0; waited = 0;
                     delay = 3 + R.nextInt(5);
                 } else {
-                    ItemStack out = m.getSlot(2).getStack();
-                    if (!out.isEmpty()) {
-                        mc.interactionManager.clickSlot(m.syncId, 2, 0, SlotActionType.QUICK_MOVE, p);
-                        trades++; used += buy.getCount(); step = 0; waited = 0;
-                        delay = 4 + R.nextInt(8);
-                    } else {
-                        if (++emptyTicks > 8) { step = 0; emptyTicks = 0; }
-                        delay = 2;
-                    }
+                    if (++emptyTicks > 8) { step = 0; emptyTicks = 0; }
+                    delay = 2;
                 }
             }
             case AIM_OUT -> {
@@ -329,7 +350,7 @@ public class ArbuzBot implements ClientModInitializer {
                     }
                 }
                 p.closeHandledScreen();
-                homeName = "Domek #2"; afterHome = S.AIM_CHEST; // zapetlenie: po powrocie znowu do skrzynki z arbuzami
+                homeName = "Domek #2"; afterHome = S.DONE;
                 go(S.HOME_CMD, 15, 40);
             }
             default -> {}
@@ -364,28 +385,13 @@ public class ArbuzBot implements ClientModInitializer {
         MinecraftClient mc = MinecraftClient.getInstance();
         vPos++; attempts = 0;
         if (vPos < group().size()) { go(S.AIM_V, 15, 40); return; }
-
-        boolean stuck = blocked && mc.player != null && mc.player.getInventory().count(inputItem()) >= lastBuy;
-        blocked = false; vPos = 0;
-
-        if (vIdx == 0) {                       // koniec farmerow -> idz do XP z tym co masz
-            meloLeft = stuck;
-            vIdx = 1;
-            go(S.AIM_V, 15, 40);
+        if (blocked && mc.player != null && mc.player.getInventory().count(inputItem()) >= lastBuy) {
+            blocked = false; vPos = 0;
+            msg("Villagerzy nie sprzedaja - czekam na restock i wracam do pracy. (/arbuz-stop zeby przerwac)");
+            go(S.AIM_V, 600, 1200); // sprawdz ponownie za 30-60 s
             return;
         }
-        // koniec clericow
-        if (stuck) {
-            msg("Clericzy nie sprzedaja - czekam na restock. (/arbuz-stop zeby przerwac)");
-            go(S.AIM_V, 600, 1200);
-            return;
-        }
-        if (meloLeft) {
-            meloLeft = false; vIdx = 0;
-            msg("Zostaly arbuzy - wracam do farmerow.");
-            go(S.AIM_V, 600, 1200);
-            return;
-        }
+        if (vIdx == 0) { vIdx = 1; vPos = 0; blocked = false; go(S.AIM_V, 15, 40); return; }
         go(S.AIM_OUT, 15, 40);
     }
 
