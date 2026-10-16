@@ -81,6 +81,7 @@ public class ArbuzBot implements ClientModInitializer {
     int antiSec = 30, fleeLeft, fleeRecalc; Vec3d fleeDir;
     boolean blocked;   // ktorys villager nie sprzedawal w tej rundzie
     boolean meloLeft;  // zostaly arbuzy do sprzedania po rundzie XP
+    static final int MAX_XP_PRICE = 3; // max cena jednej butelki XP w emeraldach
     int lastBuy = 1;   // ile sztuk kosztuje jedna wymiana
 
     @Override
@@ -261,7 +262,7 @@ public class ArbuzBot implements ClientModInitializer {
                 if (aimed) {
                     int have = p.getInventory().count(inputItem());
                     if (have <= 0) { msg("Brak przedmiotow do wymiany - pomijam."); nextVillager(); return; }
-                    quota = (int) Math.ceil(have / (double) (grp.size() - vPos)); // podzial po rowno
+                    quota = vIdx == 1 ? Integer.MAX_VALUE : (int) Math.ceil(have / (double) (grp.size() - vPos)); // XP: bez limitu ilosci, farmerzy: podzial po rowno
                     used = 0; trades = 0; step = 0; emptyTicks = 0; attempts++;
                     EntityHitResult hit = new EntityHitResult(v, bb.getCenter());
                     ActionResult r = mc.interactionManager.interactEntityAtLocation(p, v, hit, Hand.MAIN_HAND);
@@ -284,6 +285,11 @@ public class ArbuzBot implements ClientModInitializer {
                 TradeOffer o = offers.get(idx);
                 ItemStack buy = o.getDisplayedFirstBuyItem();
                 lastBuy = Math.max(1, buy.getCount());
+                if (vIdx == 1 && buy.getCount() > MAX_XP_PRICE) {
+                    msg("Villager #" + (vPos + 1) + ": butelka kosztuje " + buy.getCount() + " eme (max " + MAX_XP_PRICE + ") - pomijam.");
+                    blocked = true; // cena moze spasc po restocku
+                    p.closeHandledScreen(); nextVillager(); return;
+                }
                 if (o.isDisabled() && used < quota) blocked = true; // wyprzedany - wroce po restocku
                 boolean done = o.isDisabled() || used >= quota || p.getInventory().count(buy.getItem()) < buy.getCount() || trades >= 600;
                 if (done) {
