@@ -5,10 +5,16 @@ import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallba
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.loader.api.FabricLoader;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.context.CommandContext;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.block.BlockState;
+import net.minecraft.block.Blocks;
+import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.Entity;
+import net.minecraft.entity.mob.HostileEntity;
+import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.entity.passive.VillagerEntity;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
@@ -36,17 +42,23 @@ import net.minecraft.world.RaycastContext;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.PriorityQueue;
+import java.util.function.Predicate;
 import java.util.List;
 import java.util.Properties;
 import java.util.Random;
 import java.util.UUID;
 import java.util.regex.Pattern;
 
+import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.argument;
 import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.literal;
 
 public class ArbuzBot implements ClientModInitializer {
 
-    enum S { IDLE, AIM_CHEST, TAKE, HOME_CMD, HOME_GUI, TP_WAIT, AIM_V, TRADE, AIM_OUT, DEPOSIT, DONE }
+    enum S { IDLE, FLEE, AIM_CHEST, TAKE, HOME_CMD, HOME_GUI, TP_WAIT, AIM_V, TRADE, AIM_OUT, DEPOSIT, DONE }
 
     // --- konfiguracja (zapisywana w config/arbuzbot.properties) ---
     BlockPos chest, outChest;
@@ -62,6 +74,11 @@ public class ArbuzBot implements ClientModInitializer {
     String homeName = "Domek #1";
     S afterHome = S.AIM_V;
     Vec3d startPos = Vec3d.ZERO, jitter = Vec3d.ZERO, homePos = Vec3d.ZERO;
+    // --- nawigacja (A*) ---
+    record Node(BlockPos pos, double g, double f, Node parent) {}
+    List<BlockPos> path; int pi, stuckTicks, repaths; boolean navFail; Vec3d pathTarget = Vec3d.ZERO;
+    // --- ucieczka / anty-logout ---
+    int antiSec = 30, fleeLeft, fleeRecalc; Vec3d fleeDir;
     boolean blocked;   // ktorys villager nie sprzedawal w tej rundzie
     int lastBuy = 1;   // ile sztuk kosztuje jedna wymiana
 
@@ -76,9 +93,14 @@ public class ArbuzBot implements ClientModInitializer {
             d.register(literal("arbuz-villager-xp").executes(c -> setVillager(c, 1)));
             d.register(literal("arbuz-villager-eme-clear").executes(c -> { vEme.clear(); save(); c.getSource().sendFeedback(Text.literal("[Arbuz] Wyczyszczono liste villagerow eme.")); return 1; }));
             d.register(literal("arbuz-villager-xp-clear").executes(c -> { vXp.clear(); save(); c.getSource().sendFeedback(Text.literal("[Arbuz] Wyczyszczono liste villagerow xp.")); return 1; }));
+            d.register(literal("arbuz-antylogout").then(argument("sekundy", IntegerArgumentType.integer(1, 600)).executes(c -> {
+                antiSec = IntegerArgumentType.getInteger(c, "sekundy"); save();
+                c.getSource().sendFeedback(Text.literal("[Arbuz] Anty-logout ustawiony na " + antiSec + " s."));
+                return 1;
+            })));
             d.register(literal("arbuz-status").executes(c -> {
                 c.getSource().sendFeedback(Text.literal("[Arbuz] skrzynia: " + (chest != null) + ", odluz: " + (outChest != null)
-                        + ", villagerzy eme: " + vEme.size() + ", villagerzy xp: " + vXp.size() + ", stan: " + s));
+                        + ", villagerzy eme: " + vEme.size() + ", villagerzy xp: " + vXp.size() + ", anty-logout: " + antiSec + " s, stan: " + s));
                 return 1;
             }));
             d.register(literal("arbuz-start").executes(c -> {
@@ -131,7 +153,8 @@ public class ArbuzBot implements ClientModInitializer {
         if (s == S.IDLE || s == S.DONE) return;
         ClientPlayerEntity p = mc.player;
         if (p == null || mc.world == null || mc.interactionManager == null) { s = S.IDLE; return; }
-        if (p.hurtTime > 0) { fail("Dostales obrazenia - zatrzymuje bota."); return; }
+        if (s == S.FLEE) { flee(mc, p); return; }
+        if (p.hurtTime > 0) { startFlee(mc, p); return; }
         if (delay > 0) { delay--; return; }
         if (++waited > 800) { fail("Timeout w kroku " + s); return; }
 
@@ -225,11 +248,15 @@ public class ArbuzBot implements ClientModInitializer {
                     msg("Nie moge dojsc do villagera #" + (vPos + 1) + " (sciana / przeszkoda?) - pomijam."); nextVillager(); return;
                 }
                 boolean los = visible(mc, p, v);            // czy widze villagera (bez scian)
-                boolean walkOn = (!los && dist > 0.8) || dist > 2.3;
-                moveTo(mc, p, walkOn);
+                if (!(los && dist <= 2.8)) {
+                    // idz sciezka (A*) w miejsce, z ktorego villager jest w zasiegu i widoczny
+                    if (navigate(mc, p, n -> goalEntity(mc, n, v), bb.getCenter(), homePos) && ++repaths > 3) navFail = true;
+                    if (navFail) { msg("Nie znalazlem drogi do villagera #" + (vPos + 1) + " - pomijam."); nextVillager(); }
+                    return;
+                }
+                moveTo(mc, p, false); path = null;
                 boolean aimed = aim(p, bb.getCenter().add(jitter.multiply(0.3)));
-                if (aimed && los && dist <= 2.9) {
-                    moveTo(mc, p, false);
+                if (aimed) {
                     int have = p.getInventory().count(inputItem());
                     if (have <= 0) { msg("Brak przedmiotow do wymiany - pomijam."); nextVillager(); return; }
                     quota = (int) Math.ceil(have / (double) (grp.size() - vPos)); // podzial po rowno
@@ -303,7 +330,7 @@ public class ArbuzBot implements ClientModInitializer {
 
     // ================= pomocnicze =================
     void go(S next, int minD, int maxD) {
-        s = next; waited = 0; walk(false);
+        s = next; waited = 0; walk(false); path = null; repaths = 0; navFail = false;
         delay = minD + R.nextInt(Math.max(1, maxD - minD + 1));
         jitter = new Vec3d((R.nextDouble() - .5) * .5, (R.nextDouble() - .5) * .5, (R.nextDouble() - .5) * .5);
     }
@@ -321,7 +348,7 @@ public class ArbuzBot implements ClientModInitializer {
 
     void walk(boolean on) {
         MinecraftClient mc = MinecraftClient.getInstance();
-        if (mc.options != null) { mc.options.forwardKey.setPressed(on); if (!on) mc.options.jumpKey.setPressed(false); }
+        if (mc.options != null) { mc.options.forwardKey.setPressed(on); if (!on) { mc.options.jumpKey.setPressed(false); mc.options.sprintKey.setPressed(false); } }
     }
 
     /** Nastepny villager; po ostatniej wymianie sprawdza czy trzeba czekac na restock. */
@@ -340,13 +367,191 @@ public class ArbuzBot implements ClientModInitializer {
     }
 
     /** Czy miedzy mna a villagerem nie ma bloku (zeby nie otwierac przez sciane). */
-    boolean visible(MinecraftClient mc, ClientPlayerEntity p, Entity v) {
-        Vec3d eye = p.getEyePos();
+    boolean visible(MinecraftClient mc, ClientPlayerEntity p, Entity v) { return canSee(mc, p.getEyePos(), v); }
+
+    boolean canSee(MinecraftClient mc, Vec3d eye, Entity v) {
         for (Vec3d t : new Vec3d[]{v.getEyePos(), v.getBoundingBox().getCenter()}) {
-            BlockHitResult r = mc.world.raycast(new RaycastContext(eye, t, RaycastContext.ShapeType.OUTLINE, RaycastContext.FluidHandling.NONE, p));
+            BlockHitResult r = mc.world.raycast(new RaycastContext(eye, t, RaycastContext.ShapeType.OUTLINE, RaycastContext.FluidHandling.NONE, mc.player));
             if (r.getType() == HitResult.Type.MISS || r.getPos().distanceTo(eye) >= eye.distanceTo(t) - 0.25) return true;
         }
         return false;
+    }
+
+    boolean goalEntity(MinecraftClient mc, BlockPos n, Entity v) {
+        Vec3d eye = new Vec3d(n.getX() + .5, n.getY() + 1.62, n.getZ() + .5);
+        Box b = v.getBoundingBox();
+        Vec3d c = b.getCenter();
+        if (Math.abs(eye.x - c.x) > 3.2 || Math.abs(eye.z - c.z) > 3.2 || Math.abs(eye.y - c.y) > 3.5) return false;
+        Vec3d near = new Vec3d(MathHelper.clamp(eye.x, b.minX, b.maxX), MathHelper.clamp(eye.y, b.minY, b.maxY), MathHelper.clamp(eye.z, b.minZ, b.maxZ));
+        return eye.distanceTo(near) <= 2.6 && canSee(mc, eye, v);
+    }
+
+    boolean blockSeen(MinecraftClient mc, Vec3d eye, BlockPos pos) {
+        BlockHitResult r = mc.world.raycast(new RaycastContext(eye, Vec3d.ofCenter(pos), RaycastContext.ShapeType.OUTLINE, RaycastContext.FluidHandling.NONE, mc.player));
+        if (r.getType() != HitResult.Type.BLOCK) return false;
+        BlockPos bp = r.getBlockPos();
+        return bp.equals(pos) || (mc.world.getBlockState(bp).getBlock() == mc.world.getBlockState(pos).getBlock() && bp.getSquaredDistance(pos) <= 2);
+    }
+
+    // ================= nawigacja A* =================
+    boolean passable(ClientWorld w, BlockPos pos) {
+        BlockState s = w.getBlockState(pos);
+        return s.getCollisionShape(w, pos).isEmpty() && s.getFluidState().isEmpty()
+                && !s.isOf(Blocks.FIRE) && !s.isOf(Blocks.SOUL_FIRE) && !s.isOf(Blocks.COBWEB)
+                && !s.isOf(Blocks.SWEET_BERRY_BUSH) && !s.isOf(Blocks.POWDER_SNOW);
+    }
+
+    boolean standable(ClientWorld w, BlockPos pos) {
+        if (!passable(w, pos) || !passable(w, pos.up())) return false;
+        BlockPos fl = pos.down();
+        BlockState b = w.getBlockState(fl);
+        return !b.getCollisionShape(w, fl).isEmpty() && !b.isOf(Blocks.MAGMA_BLOCK) && !b.isOf(Blocks.CACTUS)
+                && !b.isOf(Blocks.CAMPFIRE) && !b.isOf(Blocks.SOUL_CAMPFIRE);
+    }
+
+    List<BlockPos> findPath(ClientWorld w, BlockPos start, Predicate<BlockPos> goal, Vec3d heur, Vec3d origin) {
+        PriorityQueue<Node> open = new PriorityQueue<>(Comparator.comparingDouble(Node::f));
+        HashMap<Long, Double> best = new HashMap<>();
+        open.add(new Node(start, 0, 0, null));
+        best.put(start.asLong(), 0.0);
+        int[][] dirs = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+        int[] dys = {0, 1, -1, -2, -3};
+        int iter = 0;
+        while (!open.isEmpty() && iter++ < 9000) {
+            Node cur = open.poll();
+            if (cur.g() > best.getOrDefault(cur.pos().asLong(), 1e18)) continue;
+            if (goal.test(cur.pos())) {
+                LinkedList<BlockPos> r = new LinkedList<>();
+                for (Node n = cur; n != null; n = n.parent()) r.addFirst(n.pos());
+                return r;
+            }
+            BlockPos base = cur.pos();
+            for (int[] d : dirs) {
+                boolean diag = d[0] != 0 && d[1] != 0;
+                for (int dy : dys) {
+                    if (diag && dy != 0) continue;
+                    BlockPos np = base.add(d[0], dy, d[1]);
+                    if (!standable(w, np)) continue;
+                    if (dy == 1 && !passable(w, base.up(2))) continue;
+                    if (diag && (!passable(w, base.add(d[0], 0, 0)) || !passable(w, base.add(d[0], 1, 0))
+                            || !passable(w, base.add(0, 0, d[1])) || !passable(w, base.add(0, 1, d[1])))) continue;
+                    if (dy < 0) {
+                        boolean ok = true;
+                        for (int k = 0; k <= -dy && ok; k++)
+                            if (!passable(w, base.add(d[0], -k, d[1])) || !passable(w, base.add(d[0], -k + 1, d[1]))) ok = false;
+                        if (!ok) continue;
+                    }
+                    if (Vec3d.ofBottomCenter(np).distanceTo(origin) > MAX_WALK + 3) continue;
+                    double g = cur.g() + (diag ? 1.414 : 1.0) + (dy != 0 ? 0.6 : 0) + (dy < 0 ? -dy * 0.3 : 0);
+                    if (g >= best.getOrDefault(np.asLong(), 1e18)) continue;
+                    best.put(np.asLong(), g);
+                    double hc = Math.max(0, Vec3d.ofBottomCenter(np).distanceTo(heur) - 2.0);
+                    open.add(new Node(np, g, g + hc, cur));
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Idzie sciezka do celu. Zwraca true gdy doszedl do konca sciezki. navFail=true gdy sie nie da. */
+    boolean navigate(MinecraftClient mc, ClientPlayerEntity p, Predicate<BlockPos> goal, Vec3d heur, Vec3d origin) {
+        if (path != null && pathTarget.distanceTo(heur) > 2.5) path = null; // cel sie ruszyl
+        if (path == null) {
+            path = findPath(mc.world, p.getBlockPos(), goal, heur, origin);
+            pi = 0; stuckTicks = 0; pathTarget = heur;
+            if (path == null) { navFail = true; moveTo(mc, p, false); return false; }
+        }
+        // przeskocz punkty, ktore juz minelismy
+        while (pi < path.size()) {
+            BlockPos wp = path.get(pi);
+            double dh = Math.hypot(p.getX() - (wp.getX() + .5), p.getZ() - (wp.getZ() + .5));
+            if (dh < 0.45 && Math.abs(p.getY() - wp.getY()) < 1.3) pi++; else break;
+        }
+        if (pi >= path.size()) { path = null; moveTo(mc, p, false); return true; }
+        BlockPos wp = path.get(pi);
+        Vec3d c = new Vec3d(wp.getX() + .5, wp.getY(), wp.getZ() + .5);
+        aim(p, new Vec3d(c.x, p.getEyeY(), c.z));
+        mc.options.forwardKey.setPressed(true);
+        boolean up = c.y > p.getY() + 0.3;
+        mc.options.jumpKey.setPressed(p.isOnGround() && (up || p.horizontalCollision));
+        double speed = Math.hypot(p.getVelocity().x, p.getVelocity().z);
+        if (speed < 0.03) stuckTicks++; else stuckTicks = 0;
+        if (stuckTicks > 40) { path = null; stuckTicks = 0; if (++repaths > 3) navFail = true; }
+        return false;
+    }
+
+    // ================= ucieczka + anty-logout =================
+    void startFlee(MinecraftClient mc, ClientPlayerEntity p) {
+        if (p.currentScreenHandler != p.playerScreenHandler) p.closeHandledScreen();
+        walk(false);
+        fleeLeft = antiSec * 20 + 20; fleeRecalc = 0; fleeDir = null; path = null;
+        s = S.FLEE;
+        msg("Dostalem obrazenia - ucieka. Po " + antiSec + " s bez trafienia wyloguje sie.");
+    }
+
+    void flee(MinecraftClient mc, ClientPlayerEntity p) {
+        if (p.hurtTime > 0) fleeLeft = antiSec * 20 + 20; // kazde trafienie restartuje anty-logout
+        if (--fleeLeft <= 0) {
+            walk(false);
+            msg("Koniec anty-logout - wylogowuje.");
+            s = S.IDLE;
+            if (mc.getNetworkHandler() != null)
+                mc.getNetworkHandler().getConnection().disconnect(Text.literal("[ArbuzBot] Koniec anty-logout - wylogowano."));
+            return;
+        }
+        if (fleeRecalc-- <= 0) { fleeRecalc = 8; fleeDir = bestDirection(mc, p); }
+        if (fleeDir == null) { walk(false); return; }
+        aim(p, p.getEyePos().add(fleeDir.multiply(5)));
+        mc.options.forwardKey.setPressed(true);
+        mc.options.sprintKey.setPressed(true);
+        mc.options.jumpKey.setPressed(p.horizontalCollision && p.isOnGround());
+    }
+
+    /** Wybiera kierunek ucieczki: tam gdzie jest wolne miejsce, najlepiej od najblizszego gracza/moba. */
+    Vec3d bestDirection(MinecraftClient mc, ClientPlayerEntity p) {
+        Vec3d pos = p.getPos(), threat = null;
+        double bd = 16;
+        for (PlayerEntity o : mc.world.getPlayers()) {
+            if (o == p) continue;
+            double d = o.getPos().distanceTo(pos);
+            if (d < bd) { bd = d; threat = o.getPos(); }
+        }
+        if (threat == null) {
+            for (Entity e : mc.world.getEntities()) {
+                if (!(e instanceof HostileEntity)) continue;
+                double d = e.getPos().distanceTo(pos);
+                if (d < bd) { bd = d; threat = e.getPos(); }
+            }
+        }
+        Vec3d best = null; double bestScore = -1e9;
+        for (int i = 0; i < 16; i++) {
+            double ang = i * Math.PI / 8;
+            Vec3d dir = new Vec3d(Math.cos(ang), 0, Math.sin(ang));
+            double free = freeDist(mc, p, dir, 10);
+            if (free < 1.2) continue;
+            BlockPos ahead = BlockPos.ofFloored(pos.add(dir.multiply(Math.min(free, 2.5))));
+            boolean ground = false;
+            for (int k = 1; k <= 3 && !ground; k++)
+                if (!mc.world.getBlockState(ahead.down(k)).getCollisionShape(mc.world, ahead.down(k)).isEmpty()) ground = true;
+            if (!ground || !mc.world.getFluidState(ahead).isEmpty()) continue; // klif / woda
+            double score = Math.min(free, 10);
+            if (threat != null) {
+                Vec3d away = pos.subtract(threat).multiply(1, 0, 1);
+                if (away.lengthSquared() > 1e-4) score += 6 * dir.dotProduct(away.normalize());
+            }
+            if (score > bestScore) { bestScore = score; best = dir; }
+        }
+        return best;
+    }
+
+    double freeDist(MinecraftClient mc, ClientPlayerEntity p, Vec3d dir, double max) {
+        double m = max;
+        for (double h : new double[]{0.3, 1.7}) {
+            Vec3d a = p.getPos().add(0, h, 0);
+            BlockHitResult r = mc.world.raycast(new RaycastContext(a, a.add(dir.multiply(max)), RaycastContext.ShapeType.COLLIDER, RaycastContext.FluidHandling.NONE, p));
+            if (r.getType() == HitResult.Type.BLOCK) m = Math.min(m, r.getPos().distanceTo(a));
+        }
+        return m;
     }
 
     /** Ruch do przodu; przy przeszkodzie (kolizja) skacze jak gracz. */
@@ -372,20 +577,27 @@ public class ArbuzBot implements ClientModInitializer {
         return -1;
     }
 
-    /** Podchodzi do skrzynki (max 30 m), celuje plynnie i otwiera ja gdy faktycznie na nia patrzy. */
+    /** Podchodzi do skrzynki sciezka (max 30 m), celuje plynnie i otwiera ja gdy faktycznie na nia patrzy. */
     boolean openBlock(MinecraftClient mc, ClientPlayerEntity p, BlockPos pos) {
         Vec3d c = Vec3d.ofCenter(pos);
         double d = p.getEyePos().distanceTo(c);
         if (d > MAX_WALK) { fail("Skrzynka " + pos.toShortString() + " dalej niz " + (int) MAX_WALK + " m."); return false; }
-        moveTo(mc, p, d > 4.0);
+        if (!(d <= 4.0 && blockSeen(mc, p.getEyePos(), pos))) {
+            Vec3d origin = p.getPos();
+            if (navigate(mc, p, n -> {
+                Vec3d eye = new Vec3d(n.getX() + .5, n.getY() + 1.62, n.getZ() + .5);
+                return eye.distanceTo(c) <= 3.8 && blockSeen(mc, eye, pos);
+            }, c, origin) && ++repaths > 3) navFail = true;
+            if (navFail) fail("Nie moge dojsc do skrzynki " + pos.toShortString() + ".");
+            return false;
+        }
+        moveTo(mc, p, false); path = null;
         aim(p, c.add(jitter.multiply(0.6)));
-        if (d > 4.4) return false;
         HitResult hr = p.raycast(4.5, 1.0f, false);
         if (hr instanceof BlockHitResult b && b.getType() == HitResult.Type.BLOCK) {
             BlockPos bp = b.getBlockPos();
             boolean same = bp.equals(pos) || (mc.world.getBlockState(bp).getBlock() == mc.world.getBlockState(pos).getBlock() && bp.getSquaredDistance(pos) <= 2);
             if (same) {
-                moveTo(mc, p, false);
                 mc.interactionManager.interactBlock(p, Hand.MAIN_HAND, b);
                 p.swingHand(Hand.MAIN_HAND);
                 return true;
@@ -419,6 +631,7 @@ public class ArbuzBot implements ClientModInitializer {
             Properties pr = new Properties();
             if (chest != null) pr.setProperty("chest", chest.asLong() + "");
             if (outChest != null) pr.setProperty("outChest", outChest.asLong() + "");
+            pr.setProperty("antiSec", antiSec + "");
             pr.setProperty("vEme", join(vEme));
             pr.setProperty("vXp", join(vXp));
             try (var w = Files.newBufferedWriter(CFG)) { pr.store(w, "ArbuzBot"); }
@@ -446,6 +659,7 @@ public class ArbuzBot implements ClientModInitializer {
             try (var r = Files.newBufferedReader(CFG)) { pr.load(r); }
             if (pr.containsKey("chest")) chest = BlockPos.fromLong(Long.parseLong(pr.getProperty("chest")));
             if (pr.containsKey("outChest")) outChest = BlockPos.fromLong(Long.parseLong(pr.getProperty("outChest")));
+            antiSec = Integer.parseInt(pr.getProperty("antiSec", "30"));
             parse(pr.getProperty("vEme", ""), vEme);
             parse(pr.getProperty("vXp", ""), vXp);
         } catch (Exception ignored) {}
