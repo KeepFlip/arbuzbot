@@ -80,6 +80,7 @@ public class ArbuzBot implements ClientModInitializer {
     // --- ucieczka / anty-logout ---
     int antiSec = 30, fleeLeft, fleeRecalc; Vec3d fleeDir;
     boolean blocked;   // ktorys villager nie sprzedawal w tej rundzie
+    boolean meloLeft;  // zostaly arbuzy do sprzedania po rundzie XP
     int lastBuy = 1;   // ile sztuk kosztuje jedna wymiana
 
     @Override
@@ -188,7 +189,7 @@ public class ArbuzBot implements ClientModInitializer {
                         delay = 3 + R.nextInt(7);
                         if (taken >= 5) {
                             p.closeHandledScreen();
-                            homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0; vPos = 0; attempts = 0; blocked = false;
+                            homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0; vPos = 0; attempts = 0; blocked = false; meloLeft = false;
                             go(S.HOME_CMD, 10, 30);
                         }
                         return;
@@ -196,7 +197,7 @@ public class ArbuzBot implements ClientModInitializer {
                 }
                 // brak wiecej arbuzow do wziecia
                 p.closeHandledScreen();
-                homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0; vPos = 0; attempts = 0; blocked = false;
+                homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0; vPos = 0; attempts = 0; blocked = false; meloLeft = false;
                 go(S.HOME_CMD, 10, 30);
             }
             case HOME_CMD -> {
@@ -357,13 +358,28 @@ public class ArbuzBot implements ClientModInitializer {
         MinecraftClient mc = MinecraftClient.getInstance();
         vPos++; attempts = 0;
         if (vPos < group().size()) { go(S.AIM_V, 15, 40); return; }
-        if (blocked && mc.player != null && mc.player.getInventory().count(inputItem()) >= lastBuy) {
-            blocked = false; vPos = 0;
-            msg("Villagerzy nie sprzedaja - czekam na restock i wracam do pracy. (/arbuz-stop zeby przerwac)");
-            go(S.AIM_V, 600, 1200); // sprawdz ponownie za 30-60 s
+
+        boolean stuck = blocked && mc.player != null && mc.player.getInventory().count(inputItem()) >= lastBuy;
+        blocked = false; vPos = 0;
+
+        if (vIdx == 0) {                       // koniec farmerow -> idz do XP z tym co masz
+            meloLeft = stuck;
+            vIdx = 1;
+            go(S.AIM_V, 15, 40);
             return;
         }
-        if (vIdx == 0) { vIdx = 1; vPos = 0; blocked = false; go(S.AIM_V, 15, 40); return; }
+        // koniec clericow
+        if (stuck) {
+            msg("Clericzy nie sprzedaja - czekam na restock. (/arbuz-stop zeby przerwac)");
+            go(S.AIM_V, 600, 1200);
+            return;
+        }
+        if (meloLeft) {
+            meloLeft = false; vIdx = 0;
+            msg("Zostaly arbuzy - wracam do farmerow.");
+            go(S.AIM_V, 600, 1200);
+            return;
+        }
         go(S.AIM_OUT, 15, 40);
     }
 
