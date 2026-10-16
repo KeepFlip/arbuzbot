@@ -223,6 +223,7 @@ public class ArbuzBot implements ClientModInitializer {
                     if (afterHome == S.DONE) { s = S.DONE; msg("Gotowe - jestem na " + homeName + "."); return; }
                     if (h != p.playerScreenHandler) p.closeHandledScreen();
                     homePos = p.getPos();
+                    if (afterHome == S.AIM_CHEST) { taken = 0; counted = false; msg("Nowa runda - czekam na arbuzy w skrzynce."); }
                     go(afterHome, 40, 90); // czekanie na zaladowanie chunkow
                 }
             }
@@ -321,7 +322,7 @@ public class ArbuzBot implements ClientModInitializer {
                     }
                 }
                 p.closeHandledScreen();
-                homeName = "Domek #2"; afterHome = S.DONE;
+                homeName = "Domek #2"; afterHome = S.AIM_CHEST; // zapetlenie: po powrocie znowu do skrzynki z arbuzami
                 go(S.HOME_CMD, 15, 40);
             }
             default -> {}
