@@ -6,6 +6,7 @@ import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.loader.api.FabricLoader;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.context.CommandContext;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
@@ -39,8 +40,13 @@ import net.minecraft.village.TradeOffer;
 import net.minecraft.village.TradeOfferList;
 import net.minecraft.world.RaycastContext;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -71,6 +77,9 @@ public class ArbuzBot implements ClientModInitializer {
     int takenTotal, needTotal;
     int passMade, idlePasses;              // ile wymian w tym przejsciu / ile przejsc z rzedu bez zadnej wymiany
     final int[] lastBuyG = {1, 1};         // ile sztuk kosztuje wymiana (0 = arbuzy->eme, 1 = eme->xp)
+    String webhook = "";                   // adres webhooka Discord (puste = wylaczone)
+    int depositedBottles, cycles;
+    static final HttpClient HTTP = HttpClient.newHttpClient();
     boolean paused;                        // wstrzymany: stan zostaje zachowany i bot wznawia od tego samego miejsca
     boolean split = false;                 // true = podzial po rowno miedzy villagerow (po jednej wymianie), false = shift (wszystko naraz)
     int startAvail = -1, lastAvail = -1, stall;
@@ -105,6 +114,18 @@ public class ArbuzBot implements ClientModInitializer {
                 c.getSource().sendFeedback(Text.literal("[Arbuz] Anty-logout ustawiony na " + antiSec + " s."));
                 return 1;
             })));
+            d.register(literal("arbuz-webhook").then(argument("url", StringArgumentType.greedyString()).executes(c -> {
+                String url = StringArgumentType.getString(c, "url").trim();
+                if (!(url.startsWith("https://discord.com/api/webhooks/") || url.startsWith("https://discordapp.com/api/webhooks/"))) {
+                    c.getSource().sendFeedback(Text.literal("[Arbuz] To nie wyglada na webhook Discorda (https://discord.com/api/webhooks/...)."));
+                    return 0;
+                }
+                webhook = url; save();
+                c.getSource().sendFeedback(Text.literal("[Arbuz] Webhook zapisany. Wysylam wiadomosc testowa..."));
+                hook("Test webhooka", 5793266, "Status", "Polaczenie dziala");
+                return 1;
+            })));
+            d.register(literal("arbuz-webhook-off").executes(c -> { webhook = ""; save(); c.getSource().sendFeedback(Text.literal("[Arbuz] Webhook wylaczony.")); return 1; }));
             d.register(literal("arbuz-wstrzymaj").executes(c -> { pauseBot(c.getSource().getClient()); return 1; }));
             d.register(literal("arbuz-startuj").executes(c -> { resumeBot(c.getSource().getClient()); return 1; }));
             d.register(literal("arbuz-podzial").executes(c -> {
@@ -114,7 +135,7 @@ public class ArbuzBot implements ClientModInitializer {
             }));
             d.register(literal("arbuz-status").executes(c -> {
                 c.getSource().sendFeedback(Text.literal("[Arbuz] skrzynia: " + (chest != null) + ", odluz: " + (outChest != null)
-                        + ", villagerzy eme: " + vEme.size() + ", villagerzy xp: " + vXp.size() + ", wstrzymany: " + paused + ", podzial: " + split + ", anty-logout: " + antiSec + " s, stan: " + s));
+                        + ", villagerzy eme: " + vEme.size() + ", villagerzy xp: " + vXp.size() + ", webhook: " + (webhook.isEmpty() ? "wylaczony" : "wlaczony") + ", wstrzymany: " + paused + ", podzial: " + split + ", anty-logout: " + antiSec + " s, stan: " + s));
                 return 1;
             }));
             d.register(literal("arbuz-start").executes(c -> {
@@ -127,6 +148,7 @@ public class ArbuzBot implements ClientModInitializer {
                 taken = 0; counted = false;
                 go(S.AIM_CHEST, 10, 30);
                 c.getSource().sendFeedback(Text.literal("[Arbuz] Start. Czekam na 5 stakow arbuzow w skrzynce."));
+                hook("Bot uruchomiony", 5763719, "Tryb wymiany", split ? "podzial po rowno" : "wszystko naraz (shift)", "Villagerzy", "eme: " + vEme.size() + ", xp: " + vXp.size());
                 return 1;
             }));
             d.register(literal("arbuz-stop").executes(c -> { s = S.IDLE; paused = false; save(); walk(false); c.getSource().sendFeedback(Text.literal("[Arbuz] Stop.")); return 1; }));
@@ -251,6 +273,10 @@ public class ArbuzBot implements ClientModInitializer {
                     if (afterHome == S.DONE) {
                         // jestem na Domek #2 - bot dziala dalej: wraca do skrzynki z arbuzami i czeka na kolejna ture
                         msg("Jestem na " + homeName + " - czekam na kolejne arbuzy.");
+                        cycles++;
+                        hook("Tura zakonczona", 5763719, "Tura nr", cycles + "", "Odlozone butelki XP", depositedBottles + " szt.",
+                                "Arbuzy w eq", p.getInventory().count(Items.MELON) + "", "Emeraldy w eq", p.getInventory().count(Items.EMERALD) + "");
+                        depositedBottles = 0;
                         taken = 0; counted = false;
                         go(S.AIM_CHEST, 40, 90);
                         return;
@@ -382,6 +408,7 @@ public class ArbuzBot implements ClientModInitializer {
                 int chestSlots = g.getRows() * 9;
                 for (int i = chestSlots; i < g.slots.size(); i++) {
                     if (g.getSlot(i).getStack().isOf(Items.EXPERIENCE_BOTTLE)) {
+                        depositedBottles += g.getSlot(i).getStack().getCount();
                         mc.interactionManager.clickSlot(g.syncId, i, 0, SlotActionType.QUICK_MOVE, p);
                         waited = 0; delay = 3 + R.nextInt(7);
                         return;
@@ -402,7 +429,7 @@ public class ArbuzBot implements ClientModInitializer {
         jitter = new Vec3d((R.nextDouble() - .5) * .5, (R.nextDouble() - .5) * .5, (R.nextDouble() - .5) * .5);
     }
 
-    void fail(String m) { s = S.IDLE; walk(false); msg("BLAD: " + m); }
+    void fail(String m) { s = S.IDLE; walk(false); msg("BLAD: " + m); hook("Blad - bot zatrzymany", 15548997, "Powod", m); }
 
     void msg(String m) {
         MinecraftClient mc = MinecraftClient.getInstance();
@@ -448,6 +475,7 @@ public class ArbuzBot implements ClientModInitializer {
         if (wait) {
             idlePasses = 0;
             msg("Villagerzy nie sprzedaja - czekam na restock i wracam do pracy. (/arbuz-stop zeby przerwac)");
+            hook("Czekam na restock villagerow", 16705372, "Arbuzy w eq", p.getInventory().count(Items.MELON) + "", "Emeraldy w eq", p.getInventory().count(Items.EMERALD) + "");
             go(S.AIM_V, 600, 1200); // sprawdz ponownie za 30-60 s
         } else {
             if (next != cur) msg("Przechodze do villagerow " + (next == 0 ? "eme (arbuzy)" : "xp (butelki)") + ".");
@@ -569,6 +597,43 @@ public class ArbuzBot implements ClientModInitializer {
         return false;
     }
 
+    // ================= webhook Discord =================
+    static String esc(String s) {
+        StringBuilder b = new StringBuilder();
+        for (char ch : s.toCharArray()) {
+            switch (ch) {
+                case '"' -> b.append("\\\"");
+                case '\\' -> b.append("\\\\");
+                case '\n' -> b.append("\\n");
+                case '\r' -> { }
+                case '\t' -> b.append(' ');
+                default -> { if (ch >= 32) b.append(ch); }
+            }
+        }
+        return b.toString();
+    }
+
+    /** Wysyla embed na webhook Discorda (asynchronicznie). kv = pary: nazwa pola, wartosc. */
+    void hook(String title, int color, String... kv) {
+        if (webhook == null || webhook.isBlank()) return;
+        try {
+            MinecraftClient mc = MinecraftClient.getInstance();
+            String server = mc.getCurrentServerEntry() != null ? mc.getCurrentServerEntry().address : "singleplayer";
+            String user = mc.getSession() != null ? mc.getSession().getUsername() : "?";
+            StringBuilder fields = new StringBuilder();
+            for (int i = 0; i + 1 < kv.length; i += 2)
+                fields.append("{\"name\":\"").append(esc(kv[i])).append("\",\"value\":\"").append(esc(kv[i + 1])).append("\",\"inline\":true},");
+            fields.append("{\"name\":\"Gracz\",\"value\":\"").append(esc(user)).append("\",\"inline\":true},");
+            fields.append("{\"name\":\"Serwer\",\"value\":\"").append(esc(server)).append("\",\"inline\":true}");
+            String json = "{\"username\":\"ArbuzBot\",\"embeds\":[{\"title\":\"" + esc(title) + "\",\"color\":" + color
+                    + ",\"fields\":[" + fields + "],\"footer\":{\"text\":\"ArbuzBot\"},\"timestamp\":\"" + Instant.now() + "\"}]}";
+            HttpRequest req = HttpRequest.newBuilder(URI.create(webhook))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(json)).build();
+            HTTP.sendAsync(req, HttpResponse.BodyHandlers.discarding());
+        } catch (Exception ignored) {}
+    }
+
     // ================= wstrzymaj / wznow =================
     void pauseBot(MinecraftClient mc) {
         if (paused) { msg("Bot jest juz wstrzymany. Wpisz /arbuz-startuj."); return; }
@@ -589,6 +654,7 @@ public class ArbuzBot implements ClientModInitializer {
         paused = true;
         save();
         msg("Wstrzymano (krok: " + s + "). Postep zapisany - /arbuz-startuj wznawia od tego miejsca.");
+        hook("Bot wstrzymany", 16705372, "Krok", s.name());
     }
 
     void resumeBot(MinecraftClient mc) {
@@ -602,6 +668,7 @@ public class ArbuzBot implements ClientModInitializer {
         S next = s;
         go(next, 10, 30);
         msg("Wznowiono od kroku " + next + ".");
+        hook("Bot wznowiony", 5763719, "Krok", next.name());
     }
 
     // ================= ucieczka + anty-logout =================
@@ -611,6 +678,14 @@ public class ArbuzBot implements ClientModInitializer {
         fleeLeft = antiSec * 20 + 20; fleeRecalc = 0; fleeDir = null; path = null;
         s = S.FLEE;
         msg("Dostalem obrazenia - ucieka. Po " + antiSec + " s bez trafienia wyloguje sie.");
+        String who = "nieznany";
+        double bd = 16;
+        for (PlayerEntity o : mc.world.getPlayers()) {
+            if (o == p) continue;
+            double d = o.getPos().distanceTo(p.getPos());
+            if (d < bd) { bd = d; who = o.getName().getString(); }
+        }
+        hook("Zostalem trafiony - uciekam!", 15548997, "Najblizszy gracz", who, "HP", String.format("%.1f", p.getHealth()), "Wylogowanie za", antiSec + " s");
     }
 
     void flee(MinecraftClient mc, ClientPlayerEntity p) {
@@ -618,6 +693,7 @@ public class ArbuzBot implements ClientModInitializer {
         if (--fleeLeft <= 0) {
             walk(false);
             msg("Koniec anty-logout - wylogowuje.");
+            hook("Wylogowano z serwera (koniec anty-logout)", 16705372, "Anty-logout", antiSec + " s");
             s = S.IDLE;
             if (mc.getNetworkHandler() != null)
                 mc.getNetworkHandler().getConnection().disconnect(Text.literal("[ArbuzBot] Koniec anty-logout - wylogowano."));
@@ -757,6 +833,7 @@ public class ArbuzBot implements ClientModInitializer {
             if (outChest != null) pr.setProperty("outChest", outChest.asLong() + "");
             pr.setProperty("antiSec", antiSec + "");
             pr.setProperty("split", split + "");
+            pr.setProperty("webhook", webhook);
             if (paused) { // zapisany postep wstrzymanego bota
                 pr.setProperty("pState", s.name());
                 pr.setProperty("vIdx", vIdx + "");
@@ -795,6 +872,7 @@ public class ArbuzBot implements ClientModInitializer {
             if (pr.containsKey("outChest")) outChest = BlockPos.fromLong(Long.parseLong(pr.getProperty("outChest")));
             antiSec = Integer.parseInt(pr.getProperty("antiSec", "30"));
             split = Boolean.parseBoolean(pr.getProperty("split", "false"));
+            webhook = pr.getProperty("webhook", "");
             if (pr.containsKey("pState")) { // przywroc wstrzymany postep (po restarcie gry)
                 s = S.valueOf(pr.getProperty("pState"));
                 vIdx = Integer.parseInt(pr.getProperty("vIdx", "0"));
