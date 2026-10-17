@@ -69,6 +69,9 @@ public class ArbuzBot implements ClientModInitializer {
     static final double MAX_WALK = 30.0; // max dystans chodzenia (m)
     static final int MELON_TARGET = 320;  // 5 stakow arbuzow
     int takenTotal, needTotal;
+    boolean paused;                        // wstrzymany: stan zostaje zachowany i bot wznawia od tego samego miejsca
+    boolean split = false;                 // true = podzial po rowno miedzy villagerow (po jednej wymianie), false = shift (wszystko naraz)
+    int startAvail = -1, lastAvail = -1, stall;
     final Random R = new Random();
     S s = S.IDLE;
     int delay, waited, taken, trades, step, emptyTicks, vIdx, vPos, quota, used, attempts;
@@ -100,9 +103,16 @@ public class ArbuzBot implements ClientModInitializer {
                 c.getSource().sendFeedback(Text.literal("[Arbuz] Anty-logout ustawiony na " + antiSec + " s."));
                 return 1;
             })));
+            d.register(literal("arbuz-wstrzymaj").executes(c -> { pauseBot(c.getSource().getClient()); return 1; }));
+            d.register(literal("arbuz-startuj").executes(c -> { resumeBot(c.getSource().getClient()); return 1; }));
+            d.register(literal("arbuz-podzial").executes(c -> {
+                split = !split; save();
+                c.getSource().sendFeedback(Text.literal("[Arbuz] Podzial po rowno miedzy villagerow: " + (split ? "WLACZONY (wymienia po jednej)" : "WYLACZONY (wymienia wszystko naraz jak na shifcie)")));
+                return 1;
+            }));
             d.register(literal("arbuz-status").executes(c -> {
                 c.getSource().sendFeedback(Text.literal("[Arbuz] skrzynia: " + (chest != null) + ", odluz: " + (outChest != null)
-                        + ", villagerzy eme: " + vEme.size() + ", villagerzy xp: " + vXp.size() + ", anty-logout: " + antiSec + " s, stan: " + s));
+                        + ", villagerzy eme: " + vEme.size() + ", villagerzy xp: " + vXp.size() + ", wstrzymany: " + paused + ", podzial: " + split + ", anty-logout: " + antiSec + " s, stan: " + s));
                 return 1;
             }));
             d.register(literal("arbuz-start").executes(c -> {
@@ -111,12 +121,13 @@ public class ArbuzBot implements ClientModInitializer {
                     return 0;
                 }
                 c.getSource().getClient().options.pauseOnLostFocus = false; // bot dziala przy zminimalizowanym oknie
+                paused = false; save();
                 taken = 0; counted = false;
                 go(S.AIM_CHEST, 10, 30);
                 c.getSource().sendFeedback(Text.literal("[Arbuz] Start. Czekam na 5 stakow arbuzow w skrzynce."));
                 return 1;
             }));
-            d.register(literal("arbuz-stop").executes(c -> { s = S.IDLE; walk(false); c.getSource().sendFeedback(Text.literal("[Arbuz] Stop.")); return 1; }));
+            d.register(literal("arbuz-stop").executes(c -> { s = S.IDLE; paused = false; save(); walk(false); c.getSource().sendFeedback(Text.literal("[Arbuz] Stop.")); return 1; }));
         });
     }
 
@@ -152,6 +163,11 @@ public class ArbuzBot implements ClientModInitializer {
 
     // ================= glowna petla =================
     void tick(MinecraftClient mc) {
+        if (paused) {
+            // wstrzymany - nic nie robi, ale jak ktos go trafi, ucieka (i po anty-logoucie wylogowuje)
+            if (mc.player != null && mc.world != null && mc.player.hurtTime > 0) { paused = false; save(); startFlee(mc, mc.player); }
+            return;
+        }
         if (s == S.IDLE || s == S.DONE) return;
         ClientPlayerEntity p = mc.player;
         if (p == null || mc.world == null || mc.interactionManager == null) { s = S.IDLE; return; }
@@ -275,8 +291,9 @@ public class ArbuzBot implements ClientModInitializer {
                 if (aimed) {
                     int have = p.getInventory().count(inputItem());
                     if (have <= 0) { msg("Brak przedmiotow do wymiany - pomijam."); nextVillager(); return; }
-                    quota = (int) Math.ceil(have / (double) (grp.size() - vPos)); // podzial po rowno
+                    quota = split ? (int) Math.ceil(have / (double) (grp.size() - vPos)) : Integer.MAX_VALUE; // podzial po rowno (opcjonalny)
                     used = 0; trades = 0; step = 0; emptyTicks = 0; attempts++;
+                    startAvail = -1; lastAvail = -1; stall = 0;
                     EntityHitResult hit = new EntityHitResult(v, bb.getCenter());
                     ActionResult r = mc.interactionManager.interactEntityAtLocation(p, v, hit, Hand.MAIN_HAND);
                     if (!r.isAccepted()) mc.interactionManager.interactEntity(p, v, Hand.MAIN_HAND);
@@ -316,19 +333,30 @@ public class ArbuzBot implements ClientModInitializer {
                 // przedmioty wrzucone przez autofill do okienek wymiany tez sie licza (inaczej bot myslal ze nie ma emeraldow)
                 int avail = p.getInventory().count(buy.getItem());
                 for (int i = 0; i < 2; i++) { ItemStack st = m.getSlot(i).getStack(); if (st.isOf(buy.getItem())) avail += st.getCount(); }
+                if (startAvail < 0) startAvail = avail;
                 boolean done = o.isDisabled() || used >= quota || avail < buy.getCount() || trades >= 600;
                 if (done) {
-                    msg("Villager #" + (vPos + 1) + " (" + (vIdx == 0 ? "eme" : "xp") + "): " + trades + " wymian"
-                            + (o.isDisabled() ? " (wyprzedany)" : used >= quota ? " (jego czesc)" : "") + ".");
+                    int made = Math.max(0, (startAvail - avail) / lastBuy);
+                    msg("Villager #" + (vPos + 1) + " (" + (vIdx == 0 ? "eme" : "xp") + "): " + made + " wymian"
+                            + (o.isDisabled() ? " (wyprzedany)" : (split && used >= quota) ? " (jego czesc)" : " (koniec towaru)") + ".");
                     p.closeHandledScreen();
                     nextVillager();
                     return;
                 }
                 ItemStack out = m.getSlot(2).getStack();
                 if (!out.isEmpty()) {
-                    // jedna wymiana na raz (PICKUP, nie shift-click, bo shift-click wymienia wszystko naraz i omija podzial 50/50)
-                    mc.interactionManager.clickSlot(m.syncId, 2, 0, SlotActionType.PICKUP, p);
-                    trades++; used += buy.getCount(); step = 0; emptyTicks = 0; waited = 0;
+                    if (split) {
+                        // jedna wymiana na raz (PICKUP) - zeby dalo sie podzielic po rowno
+                        mc.interactionManager.clickSlot(m.syncId, 2, 0, SlotActionType.PICKUP, p);
+                        trades++; used += buy.getCount(); step = 0; emptyTicks = 0; waited = 0;
+                        delay = 3 + R.nextInt(6);
+                        return;
+                    }
+                    // shift-click: wymienia wszystko co jest w okienkach naraz
+                    if (avail == lastAvail) { if (++stall >= 4) { fail("Nie moge odebrac wymiany (pelny ekwipunek?)."); return; } } else stall = 0;
+                    lastAvail = avail;
+                    mc.interactionManager.clickSlot(m.syncId, 2, 0, SlotActionType.QUICK_MOVE, p);
+                    trades++; step = 0; emptyTicks = 0; waited = 0;
                     delay = 3 + R.nextInt(6);
                     return;
                 }
@@ -515,6 +543,41 @@ public class ArbuzBot implements ClientModInitializer {
         return false;
     }
 
+    // ================= wstrzymaj / wznow =================
+    void pauseBot(MinecraftClient mc) {
+        if (paused) { msg("Bot jest juz wstrzymany. Wpisz /arbuz-startuj."); return; }
+        if (s == S.IDLE || s == S.DONE) { msg("Bot nie dziala - nie ma czego wstrzymywac."); return; }
+        if (s == S.FLEE) { msg("Bot ucieka - nie moge go teraz wstrzymac."); return; }
+        ClientPlayerEntity p = mc.player;
+        if (p != null && p.currentScreenHandler != p.playerScreenHandler) p.closeHandledScreen();
+        walk(false);
+        // kroki z otwartym oknem wznawiam od otwarcia okna
+        switch (s) {
+            case TAKE -> { s = S.AIM_CHEST; counted = false; taken = 0; }
+            case TRADE -> { s = S.AIM_V; attempts = 0; }
+            case DEPOSIT -> s = S.AIM_OUT;
+            case HOME_GUI -> s = S.HOME_CMD;
+            default -> {}
+        }
+        path = null;
+        paused = true;
+        save();
+        msg("Wstrzymano (krok: " + s + "). Postep zapisany - /arbuz-startuj wznawia od tego miejsca.");
+    }
+
+    void resumeBot(MinecraftClient mc) {
+        if (!paused) { msg("Bot nie jest wstrzymany."); return; }
+        ClientPlayerEntity p = mc.player;
+        if (p == null) return;
+        if (chest == null || outChest == null || vEme.isEmpty() || vXp.isEmpty()) { msg("Brakuje zaznaczen (skrzynie / villagerzy) - sprawdz /arbuz-status."); return; }
+        if (homePos.equals(Vec3d.ZERO)) homePos = p.getPos();
+        paused = false;
+        save();
+        S next = s;
+        go(next, 10, 30);
+        msg("Wznowiono od kroku " + next + ".");
+    }
+
     // ================= ucieczka + anty-logout =================
     void startFlee(MinecraftClient mc, ClientPlayerEntity p) {
         if (p.currentScreenHandler != p.playerScreenHandler) p.closeHandledScreen();
@@ -667,6 +730,16 @@ public class ArbuzBot implements ClientModInitializer {
             if (chest != null) pr.setProperty("chest", chest.asLong() + "");
             if (outChest != null) pr.setProperty("outChest", outChest.asLong() + "");
             pr.setProperty("antiSec", antiSec + "");
+            pr.setProperty("split", split + "");
+            if (paused) { // zapisany postep wstrzymanego bota
+                pr.setProperty("pState", s.name());
+                pr.setProperty("vIdx", vIdx + "");
+                pr.setProperty("vPos", vPos + "");
+                pr.setProperty("homeName", homeName);
+                pr.setProperty("afterHome", afterHome.name());
+                pr.setProperty("blocked", blocked + "");
+                pr.setProperty("homePos", homePos.x + "," + homePos.y + "," + homePos.z);
+            }
             pr.setProperty("vEme", join(vEme));
             pr.setProperty("vXp", join(vXp));
             try (var w = Files.newBufferedWriter(CFG)) { pr.store(w, "ArbuzBot"); }
@@ -695,6 +768,18 @@ public class ArbuzBot implements ClientModInitializer {
             if (pr.containsKey("chest")) chest = BlockPos.fromLong(Long.parseLong(pr.getProperty("chest")));
             if (pr.containsKey("outChest")) outChest = BlockPos.fromLong(Long.parseLong(pr.getProperty("outChest")));
             antiSec = Integer.parseInt(pr.getProperty("antiSec", "30"));
+            split = Boolean.parseBoolean(pr.getProperty("split", "false"));
+            if (pr.containsKey("pState")) { // przywroc wstrzymany postep (po restarcie gry)
+                s = S.valueOf(pr.getProperty("pState"));
+                vIdx = Integer.parseInt(pr.getProperty("vIdx", "0"));
+                vPos = Integer.parseInt(pr.getProperty("vPos", "0"));
+                homeName = pr.getProperty("homeName", "Domek #1");
+                afterHome = S.valueOf(pr.getProperty("afterHome", "AIM_V"));
+                blocked = Boolean.parseBoolean(pr.getProperty("blocked", "false"));
+                String[] hp = pr.getProperty("homePos", "0,0,0").split(",");
+                homePos = new Vec3d(Double.parseDouble(hp[0]), Double.parseDouble(hp[1]), Double.parseDouble(hp[2]));
+                paused = (s != S.IDLE && s != S.DONE);
+            }
             parse(pr.getProperty("vEme", ""), vEme);
             parse(pr.getProperty("vXp", ""), vXp);
         } catch (Exception ignored) {}
