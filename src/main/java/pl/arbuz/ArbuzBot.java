@@ -89,6 +89,9 @@ public class ArbuzBot implements ClientModInitializer {
     final int[] lastSellG = {1, 1};        // ile sztuk daje jedna wymiana
     String lastChatBalance;                // saldo wylapane z czatu (jesli serwer je wypisuje)
     static final HttpClient HTTP = HttpClient.newHttpClient();
+    int mode = 2;                          // co wymieniac: 0 = arbuzy->eme, 1 = eme->xp, 2 = all (jedno i drugie)
+    int buyLimit = Integer.MAX_VALUE;      // ile sztuk koncowego przedmiotu kupic (MAX = nielimitowane)
+    int boughtTotal; boolean limitReached;
     boolean paused;                        // wstrzymany: stan zostaje zachowany i bot wznawia od tego samego miejsca
     boolean split = false;                 // true = podzial po rowno miedzy villagerow (po jednej wymianie), false = shift (wszystko naraz)
     int startAvail = -1, lastAvail = -1, stall;
@@ -139,6 +142,14 @@ public class ArbuzBot implements ClientModInitializer {
                 return 1;
             })));
             d.register(literal("arbuz-webhook-off").executes(c -> { webhook = ""; save(); c.getSource().sendFeedback(Text.literal("[Arbuz] Webhook wylaczony.")); return 1; }));
+            d.register(literal("arbuz-przedmiot")
+                    .then(literal("arbuz").executes(c -> setMode(c, 0)))
+                    .then(literal("xp").executes(c -> setMode(c, 1)))
+                    .then(literal("all").executes(c -> setMode(c, 2))));
+            d.register(literal("arbuz-ilosc")
+                    .then(argument("ilosc", IntegerArgumentType.integer(1, 1000000)).executes(c -> setLimit(c, IntegerArgumentType.getInteger(c, "ilosc"))))
+                    .then(literal("nielimitowane").executes(c -> setLimit(c, Integer.MAX_VALUE)))
+                    .then(literal("nielimitowana").executes(c -> setLimit(c, Integer.MAX_VALUE))));
             d.register(literal("arbuz-wstrzymaj").executes(c -> { pauseBot(c.getSource().getClient()); return 1; }));
             d.register(literal("arbuz-startuj").executes(c -> { resumeBot(c.getSource().getClient()); return 1; }));
             d.register(literal("arbuz-podzial").executes(c -> {
@@ -148,16 +159,16 @@ public class ArbuzBot implements ClientModInitializer {
             }));
             d.register(literal("arbuz-status").executes(c -> {
                 c.getSource().sendFeedback(Text.literal("[Arbuz] skrzynia: " + (chest != null) + ", odluz: " + (outChest != null)
-                        + ", villagerzy eme: " + vEme.size() + ", villagerzy xp: " + vXp.size() + ", webhook: " + (webhook.isEmpty() ? "wylaczony" : "wlaczony") + ", wstrzymany: " + paused + ", podzial: " + split + ", anty-logout: " + antiSec + " s, stan: " + s));
+                        + ", villagerzy eme: " + vEme.size() + ", villagerzy xp: " + vXp.size() + ", przedmiot: " + (mode == 0 ? "arbuz" : mode == 1 ? "xp" : "all") + ", ilosc: " + limitName() + ", webhook: " + (webhook.isEmpty() ? "wylaczony" : "wlaczony") + ", wstrzymany: " + paused + ", podzial: " + split + ", anty-logout: " + antiSec + " s, stan: " + s));
                 return 1;
             }));
             d.register(literal("arbuz-start").executes(c -> {
-                if (chest == null || outChest == null || vEme.isEmpty() || vXp.isEmpty()) {
-                    c.getSource().sendFeedback(Text.literal("[Arbuz] Najpierw zaznacz: skrzynia, skrzynia-odluz, villager-eme, villager-xp"));
+                if (!configured()) {
+                    c.getSource().sendFeedback(Text.literal("[Arbuz] Najpierw zaznacz (tryb " + modeName() + "): " + needed()));
                     return 0;
                 }
                 c.getSource().getClient().options.pauseOnLostFocus = false; // bot dziala przy zminimalizowanym oknie
-                paused = false; save(); cycles = 0; depositedBottles = 0;
+                paused = false; save(); cycles = 0; depositedBottles = 0; boughtTotal = 0; limitReached = false;
                 taken = 0; counted = false;
                 go(S.AIM_CHEST, 10, 30);
                 c.getSource().sendFeedback(Text.literal("[Arbuz] Start. Czekam na 5 stakow arbuzow w skrzynce."));
@@ -167,6 +178,45 @@ public class ArbuzBot implements ClientModInitializer {
             d.register(literal("arbuz-stop").executes(c -> { boolean was = s != S.IDLE; s = S.IDLE; paused = false; save(); walk(false); if (was) hookStop(null); c.getSource().sendFeedback(Text.literal("[Arbuz] Stop.")); return 1; }));
         });
     }
+
+    boolean configured() {
+        if (chest == null) return false;
+        if (active(0) && vEme.isEmpty()) return false;
+        if (active(1) && vXp.isEmpty()) return false;
+        if (mode != 0 && outChest == null) return false;
+        return true;
+    }
+
+    String needed() {
+        return "skrzynia" + (active(0) ? ", villager-eme" : "") + (active(1) ? ", villager-xp" : "") + (mode != 0 ? ", skrzynia-odluz" : "");
+    }
+
+    int setMode(CommandContext<FabricClientCommandSource> c, int m) {
+        mode = m; save();
+        c.getSource().sendFeedback(Text.literal("[Arbuz] Przedmiot: " + modeName() + (s != S.IDLE ? " (zadziala od nastepnej tury po /arbuz-start)" : "")));
+        return 1;
+    }
+
+    int setLimit(CommandContext<FabricClientCommandSource> c, int n) {
+        buyLimit = n; save();
+        c.getSource().sendFeedback(Text.literal("[Arbuz] Ilosc do zakupienia: " + limitName() + " (liczy sie " + (mode == 0 ? "emeraldy" : "butelki XP") + ")"));
+        return 1;
+    }
+
+    String modeName() { return mode == 0 ? "arbuz (arbuzy -> emeraldy)" : mode == 1 ? "xp (emeraldy -> butelki XP)" : "all (arbuzy -> emeraldy -> butelki XP)"; }
+
+    String limitName() { return buyLimit == Integer.MAX_VALUE ? "nielimitowana" : buyLimit + " szt."; }
+
+    /** Z ktorej grupy villagerow bot korzysta w danym trybie. */
+    boolean active(int g) { return mode == 2 || mode == g; }
+
+    int startGroup() { return mode == 1 ? 1 : 0; }
+
+    /** Grupa, ktora daje koncowy przedmiot (do limitu ilosci). */
+    boolean finalGroup(int g) { return mode == 0 ? g == 0 : g == 1; }
+
+    /** Co bot wyjmuje ze skrzynki zrodlowej. */
+    Item takeItem() { return mode == 1 ? Items.EMERALD : Items.MELON; }
 
     // ================= komendy zaznaczania =================
     int setBlock(CommandContext<FabricClientCommandSource> c, int which) {
@@ -217,9 +267,9 @@ public class ArbuzBot implements ClientModInitializer {
 
         switch (s) {
             case AIM_CHEST -> {
-                if (p.getInventory().count(Items.MELON) >= MELON_TARGET) {
-                    msg("Mam juz 5 stakow arbuzow w eq.");
-                    homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0; vPos = 0; attempts = 0; blocked = false; passMade = 0; idlePasses = 0;
+                if (p.getInventory().count(takeItem()) >= MELON_TARGET) {
+                    msg("Mam juz 5 stakow w eq.");
+                    homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = startGroup(); vPos = 0; attempts = 0; blocked = false; passMade = 0; idlePasses = 0;
                     go(S.HOME_CMD, 10, 30);
                     return;
                 }
@@ -232,23 +282,23 @@ public class ArbuzBot implements ClientModInitializer {
                 }
                 int chestSlots = g.getRows() * 9;
                 if (!counted) {
-                    int have = p.getInventory().count(Items.MELON);          // reszta arbuzow z poprzedniej tury tez sie liczy
+                    int have = p.getInventory().count(takeItem());          // reszta arbuzow z poprzedniej tury tez sie liczy
                     needTotal = MELON_TARGET - have; takenTotal = 0;
                     int sum = 0;
-                    for (int i = 0; i < chestSlots; i++) { ItemStack st = g.getSlot(i).getStack(); if (st.isOf(Items.MELON)) sum += st.getCount(); }
+                    for (int i = 0; i < chestSlots; i++) { ItemStack st = g.getSlot(i).getStack(); if (st.isOf(takeItem())) sum += st.getCount(); }
                     counted = true;
                     if (sum < needTotal) {
                         p.closeHandledScreen();
                         go(S.AIM_CHEST, 600, 1200); // za malo arbuzow - sprawdz ponownie za 30-60 s
                         return;
                     }
-                    msg("Mam " + have + " arbuzow, biore " + needTotal + " ze skrzynki (razem 5 stakow).");
+                    msg("Mam " + have + " szt., biore " + needTotal + " ze skrzynki (razem 5 stakow).");
                 }
                 if (takenTotal < needTotal) {
                     int bi = -1, bc = 0;
                     for (int i = 0; i < chestSlots; i++) {
                         ItemStack st = g.getSlot(i).getStack();
-                        if (st.isOf(Items.MELON) && st.getCount() > bc) { bi = i; bc = st.getCount(); }
+                        if (st.isOf(takeItem()) && st.getCount() > bc) { bi = i; bc = st.getCount(); }
                     }
                     if (bi >= 0) {
                         if (++taken > 20) { fail("Nie moge wziac arbuzow (pelny ekwipunek?)."); return; }
@@ -259,7 +309,7 @@ public class ArbuzBot implements ClientModInitializer {
                     }
                 }
                 p.closeHandledScreen();
-                homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0; vPos = 0; attempts = 0; blocked = false; passMade = 0; idlePasses = 0;
+                homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = startGroup(); vPos = 0; attempts = 0; blocked = false; passMade = 0; idlePasses = 0;
                 go(S.HOME_CMD, 10, 30);
             }
             case HOME_CMD -> {
@@ -285,6 +335,12 @@ public class ArbuzBot implements ClientModInitializer {
                 if (p.getPos().distanceTo(startPos) > 6) {
                     if (afterHome == S.DONE) {
                         // jestem na Domek #2 - bot dziala dalej: wraca do skrzynki z arbuzami i czeka na kolejna ture
+                        if (limitReached) {
+                            msg("Kupiono " + limitName() + " - koniec. Bot wylaczony.");
+                            s = S.DONE;
+                            hookStop(null);
+                            return;
+                        }
                         msg("Jestem na " + homeName + " - czekam na kolejne arbuzy.");
                         cycles++;
                         depositedBottles = 0;
@@ -370,12 +426,14 @@ public class ArbuzBot implements ClientModInitializer {
                 lastBuy = Math.max(1, buy.getCount());
                 lastBuyG[vIdx] = lastBuy;
                 lastSellG[vIdx] = Math.max(1, o.getSellItem().getCount());
+                boolean limited = buyLimit != Integer.MAX_VALUE && finalGroup(vIdx);
                 if (o.isDisabled() && used < quota) blocked = true; // wyprzedany - wroce po restocku
                 // przedmioty wrzucone przez autofill do okienek wymiany tez sie licza (inaczej bot myslal ze nie ma emeraldow)
                 int avail = p.getInventory().count(buy.getItem());
                 for (int i = 0; i < 2; i++) { ItemStack st = m.getSlot(i).getStack(); if (st.isOf(buy.getItem())) avail += st.getCount(); }
                 if (startAvail < 0) startAvail = avail;
-                boolean done = o.isDisabled() || used >= quota || avail < buy.getCount() || trades >= 600;
+                if (limited && boughtTotal >= buyLimit) limitReached = true;
+                boolean done = o.isDisabled() || used >= quota || avail < buy.getCount() || trades >= 600 || limitReached;
                 if (done) {
                     int made = Math.max(0, (startAvail - avail) / lastBuy);
                     passMade += made;
@@ -388,10 +446,10 @@ public class ArbuzBot implements ClientModInitializer {
                 }
                 ItemStack out = m.getSlot(2).getStack();
                 if (!out.isEmpty()) {
-                    if (split) {
-                        // jedna wymiana na raz (PICKUP) - zeby dalo sie podzielic po rowno
+                    if (split || limited) {
+                        // jedna wymiana na raz (PICKUP) - zeby dalo sie podzielic po rowno / zatrzymac na limicie ilosci
                         mc.interactionManager.clickSlot(m.syncId, 2, 0, SlotActionType.PICKUP, p);
-                        trades++; used += buy.getCount(); step = 0; emptyTicks = 0; waited = 0;
+                        trades++; used += buy.getCount(); if (finalGroup(vIdx)) boughtTotal += lastSellG[vIdx]; step = 0; emptyTicks = 0; waited = 0;
                         delay = 3 + R.nextInt(6);
                         return;
                     }
@@ -460,9 +518,17 @@ public class ArbuzBot implements ClientModInitializer {
 
     /** Nastepny villager; po ostatnim w grupie decyduje endPass(). */
     void nextVillager() {
-        vPos++; attempts = 0;
-        if (vPos < group().size()) { go(S.AIM_V, 15, 40); return; }
+        if (!limitReached) {
+            vPos++; attempts = 0;
+            if (vPos < group().size()) { go(S.AIM_V, 15, 40); return; }
+        }
         endPass();
+    }
+
+    /** Po wszystkim: tryby z butelkami odkladaja je do skrzynki, tryb "arbuz" idzie od razu na /home. */
+    void finishTrading() {
+        if (mode == 0) { homeName = "Domek #2"; afterHome = S.DONE; go(S.HOME_CMD, 15, 40); }
+        else go(S.AIM_OUT, 15, 40);
     }
 
     boolean hasInput(ClientPlayerEntity p, int g) {
@@ -480,8 +546,8 @@ public class ArbuzBot implements ClientModInitializer {
         idlePasses = passMade == 0 ? idlePasses + 1 : 0;
         passMade = 0;
         int cur = vIdx, other = 1 - vIdx;
-        boolean curHas = hasInput(p, cur), otherHas = hasInput(p, other);
-        if (!curHas && !otherHas) { go(S.AIM_OUT, 15, 40); return; }   // wszystko wymienione
+        boolean curHas = active(cur) && hasInput(p, cur), otherHas = active(other) && hasInput(p, other);
+        if (limitReached || (!curHas && !otherHas)) { finishTrading(); return; }   // wszystko wymienione / limit osiagniety
         int next = otherHas ? other : cur;
         boolean wait = (next == cur && idlePasses >= 1) || idlePasses >= 2;
         vIdx = next; vPos = 0; attempts = 0;
@@ -701,8 +767,10 @@ public class ArbuzBot implements ClientModInitializer {
 
     /** Niebieska: uruchomienie bota. */
     void hookStart() {
+        String item = mode == 0 ? "Emerald" : mode == 1 ? "Butelka XP" : "Butelka XP & Emerald";
+        String qty = buyLimit == Integer.MAX_VALUE ? "Nielimitowana" : buyLimit + " szt.";
         post("🤖 Pomyślnie uruchomiono bota!", COL_BLUE, null,
-                fld("Przedmiot", code("Butelka XP & Emerald"), true), fld("Ilość do zakupienia", code("Nielimitowana"), true), acct(), who(), srv());
+                fld("Przedmiot", code(item), true), fld("Ilość do zakupienia", code(qty), true), acct(), who(), srv());
     }
 
     /** Zolta: wylaczenie bota. Powod bledu widac tylko na czacie w grze. */
@@ -745,7 +813,7 @@ public class ArbuzBot implements ClientModInitializer {
         if (!paused) { msg("Bot nie jest wstrzymany."); return; }
         ClientPlayerEntity p = mc.player;
         if (p == null) return;
-        if (chest == null || outChest == null || vEme.isEmpty() || vXp.isEmpty()) { msg("Brakuje zaznaczen (skrzynie / villagerzy) - sprawdz /arbuz-status."); return; }
+        if (!configured()) { msg("Brakuje zaznaczen - sprawdz /arbuz-status. Potrzeba: " + needed()); return; }
         if (homePos.equals(Vec3d.ZERO)) homePos = p.getPos();
         paused = false;
         save();
@@ -909,6 +977,8 @@ public class ArbuzBot implements ClientModInitializer {
             pr.setProperty("antiSec", antiSec + "");
             pr.setProperty("split", split + "");
             pr.setProperty("webhook", webhook);
+            pr.setProperty("mode", mode + "");
+            pr.setProperty("limit", buyLimit + "");
             if (paused) { // zapisany postep wstrzymanego bota
                 pr.setProperty("pState", s.name());
                 pr.setProperty("vIdx", vIdx + "");
@@ -948,6 +1018,8 @@ public class ArbuzBot implements ClientModInitializer {
             antiSec = Integer.parseInt(pr.getProperty("antiSec", "30"));
             split = Boolean.parseBoolean(pr.getProperty("split", "false"));
             webhook = pr.getProperty("webhook", "");
+            mode = Integer.parseInt(pr.getProperty("mode", "2"));
+            buyLimit = Integer.parseInt(pr.getProperty("limit", Integer.MAX_VALUE + ""));
             if (pr.containsKey("pState")) { // przywroc wstrzymany postep (po restarcie gry)
                 s = S.valueOf(pr.getProperty("pState"));
                 vIdx = Integer.parseInt(pr.getProperty("vIdx", "0"));
