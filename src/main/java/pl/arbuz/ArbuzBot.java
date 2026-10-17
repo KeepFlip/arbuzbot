@@ -92,6 +92,7 @@ public class ArbuzBot implements ClientModInitializer {
     int mode = 2;                          // co wymieniac: 0 = arbuzy->eme, 1 = eme->xp, 2 = all (jedno i drugie)
     int buyLimit = Integer.MAX_VALUE;      // ile sztuk koncowego przedmiotu kupic (MAX = nielimitowane)
     int boughtTotal; boolean limitReached;
+    int totalBottles, totalEmeralds;       // laczny zarobek od /arbuz-start (do wiadomosci o wylaczeniu)
     boolean paused;                        // wstrzymany: stan zostaje zachowany i bot wznawia od tego samego miejsca
     boolean split = false;                 // true = podzial po rowno miedzy villagerow (po jednej wymianie), false = shift (wszystko naraz)
     int startAvail = -1, lastAvail = -1, stall;
@@ -168,7 +169,7 @@ public class ArbuzBot implements ClientModInitializer {
                     return 0;
                 }
                 c.getSource().getClient().options.pauseOnLostFocus = false; // bot dziala przy zminimalizowanym oknie
-                paused = false; save(); cycles = 0; depositedBottles = 0; boughtTotal = 0; limitReached = false;
+                paused = false; save(); cycles = 0; depositedBottles = 0; boughtTotal = 0; limitReached = false; totalBottles = 0; totalEmeralds = 0;
                 taken = 0; counted = false;
                 go(S.AIM_CHEST, 10, 30);
                 c.getSource().sendFeedback(Text.literal("[Arbuz] Start. Czekam na 5 stakow arbuzow w skrzynce."));
@@ -437,7 +438,10 @@ public class ArbuzBot implements ClientModInitializer {
                 if (done) {
                     int made = Math.max(0, (startAvail - avail) / lastBuy);
                     passMade += made;
-                    if (made > 0) hookBuy(vIdx == 0 ? "Emeraldy" : "Butelki XP", made * lastSellG[vIdx]);
+                    if (made > 0) {
+                        if (vIdx == 0) totalEmeralds += made * lastSellG[0]; else totalBottles += made * lastSellG[1];
+                        hookBuy(vIdx == 0 ? "Emeraldy" : "Butelki XP", made * lastSellG[vIdx]);
+                    }
                     msg("Villager #" + (vPos + 1) + " (" + (vIdx == 0 ? "eme" : "xp") + "): " + made + " wymian"
                             + (o.isDisabled() ? " (wyprzedany)" : (split && used >= quota) ? " (jego czesc)" : " (koniec towaru)") + ".");
                     p.closeHandledScreen();
@@ -554,7 +558,6 @@ public class ArbuzBot implements ClientModInitializer {
         if (wait) {
             idlePasses = 0;
             msg("Villagerzy nie sprzedaja - czekam na restock i wracam do pracy. (/arbuz-stop zeby przerwac)");
-            hookWait(p, next);
             go(S.AIM_V, 600, 1200); // sprawdz ponownie za 30-60 s
         } else {
             if (next != cur) msg("Przechodze do villagerow " + (next == 0 ? "eme (arbuzy)" : "xp (butelki)") + ".");
@@ -693,7 +696,7 @@ public class ArbuzBot implements ClientModInitializer {
     }
 
     // --- wiadomosci Discord (NK-Arbuz) ---
-    static final int COL_GREEN = 5763719, COL_BLUE = 3447003, COL_YELLOW = 16705372, COL_RED = 15548997;
+    static final int COL_GREEN = 5763719, COL_DARK = 2964291, COL_YELLOW = 16705372, COL_RED = 15548997;
     static final Pattern MONEY1 = Pattern.compile("(\\d[\\d\\s.,]*\\s?[kKmMbB]?)\\s*\\$");
     static final Pattern MONEY2 = Pattern.compile("\\$\\s*(\\d[\\d\\s.,]*[kKmMbB]?)");
     static final Pattern MONEY_KEY = Pattern.compile("(?i)(pieni|monet|stan konta|saldo|balance|kasa|portfel|money)");
@@ -711,10 +714,12 @@ public class ArbuzBot implements ClientModInitializer {
         return a.isEmpty() ? a : Character.toUpperCase(a.charAt(0)) + a.substring(1);
     }
 
-    String who() {
+    String userName() {
         MinecraftClient mc = MinecraftClient.getInstance();
-        return fld("Gracz", code(mc.getSession() != null ? mc.getSession().getUsername() : "?"), false);
+        return mc.getSession() != null ? mc.getSession().getUsername() : "?";
     }
+
+    String who() { return fld("Gracz", code(userName()), false); }
 
     String srv() { return fld("Serwer", code(serverName()), false); }
 
@@ -762,29 +767,25 @@ public class ArbuzBot implements ClientModInitializer {
     /** Zielona: pomyslnie zakupiono przedmiot (po kazdym villagerze). */
     void hookBuy(String item, int qty) {
         post("🛒   Pomyślnie zakupiono przedmiot!", COL_GREEN, null,
-                fld("Przedmiot", code(item), true), fld("Ilość", code(qty + " szt."), true), fld("Tura nr", code(String.valueOf(cycles + 1)), true), acct(), who(), srv());
+                fld("Przedmiot", code(item), true), fld("Ilość", code(qty + " szt."), true), acct(), who(), srv());
     }
 
     /** Niebieska: uruchomienie bota. */
     void hookStart() {
         String item = mode == 0 ? "Emerald" : mode == 1 ? "Butelka XP" : "Butelka XP & Emerald";
         String qty = buyLimit == Integer.MAX_VALUE ? "Nielimitowana" : buyLimit + " szt.";
-        post("🤖 Pomyślnie uruchomiono bota!", COL_BLUE, null,
+        post("🤖 Pomyślnie uruchomiono bota!", COL_DARK, null,
                 fld("Przedmiot", code(item), true), fld("Ilość do zakupienia", code(qty), true), acct(), who(), srv());
     }
 
-    /** Zolta: wylaczenie bota. Powod bledu widac tylko na czacie w grze. */
+    /** Czerwona: wylaczenie bota + dzisiejszy zarobek. Powod bledu widac tylko na czacie w grze. */
     void hookStop(String reason) {
-        post("🤖 Pomyślnie wyłączono bota!", COL_YELLOW, "**Dziękujemy że nasz używasz**", acct(), who(), srv());
-    }
-
-    /** Czerwona: bot czeka na villagerow (wyprzedani). */
-    void hookWait(ClientPlayerEntity p, int g) {
-        int input = p.getInventory().count(g == 0 ? Items.MELON : Items.EMERALD);
-        int qty = (input / Math.max(1, lastBuyG[g])) * lastSellG[g];
-        post("⚠️  Pomyślnie zakupiono przedmiot!", COL_RED, null,
-                fld("Przedmiot", code(g == 0 ? "Emeraldy" : "Butelki XP"), true),
-                fld(g == 0 ? "Ilość emeraldów" : "Ilość butelek z xp", code(qty + " szt."), true), who(), srv());
+        String blank = fld("\u200b", "\u200b", true); // wypelniacz, zeby w rzedzie byly 2 kolumny
+        post("❌ Pomyślnie wyłączono bota!", COL_RED, "**Twój dzisiejszy zarobek:**",
+                fld("Kupiono łącznie Butelek XP:", code(totalBottles + " szt."), true),
+                fld("Kupiono łącznie Emeraldów:", code(totalEmeralds + " szt."), true), blank,
+                fld("Stan konta", code(balance()), true), fld("Gracz", code(userName()), true), blank,
+                srv());
     }
 
     // ================= wstrzymaj / wznow =================
@@ -978,6 +979,8 @@ public class ArbuzBot implements ClientModInitializer {
             pr.setProperty("split", split + "");
             pr.setProperty("webhook", webhook);
             pr.setProperty("mode", mode + "");
+            pr.setProperty("totBottles", totalBottles + "");
+            pr.setProperty("totEmeralds", totalEmeralds + "");
             pr.setProperty("limit", buyLimit + "");
             if (paused) { // zapisany postep wstrzymanego bota
                 pr.setProperty("pState", s.name());
@@ -1019,6 +1022,8 @@ public class ArbuzBot implements ClientModInitializer {
             split = Boolean.parseBoolean(pr.getProperty("split", "false"));
             webhook = pr.getProperty("webhook", "");
             mode = Integer.parseInt(pr.getProperty("mode", "2"));
+            totalBottles = Integer.parseInt(pr.getProperty("totBottles", "0"));
+            totalEmeralds = Integer.parseInt(pr.getProperty("totEmeralds", "0"));
             buyLimit = Integer.parseInt(pr.getProperty("limit", Integer.MAX_VALUE + ""));
             if (pr.containsKey("pState")) { // przywroc wstrzymany postep (po restarcie gry)
                 s = S.valueOf(pr.getProperty("pState"));
