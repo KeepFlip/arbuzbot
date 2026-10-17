@@ -69,6 +69,8 @@ public class ArbuzBot implements ClientModInitializer {
     static final double MAX_WALK = 30.0; // max dystans chodzenia (m)
     static final int MELON_TARGET = 320;  // 5 stakow arbuzow
     int takenTotal, needTotal;
+    int passMade, idlePasses;              // ile wymian w tym przejsciu / ile przejsc z rzedu bez zadnej wymiany
+    final int[] lastBuyG = {1, 1};         // ile sztuk kosztuje wymiana (0 = arbuzy->eme, 1 = eme->xp)
     boolean paused;                        // wstrzymany: stan zostaje zachowany i bot wznawia od tego samego miejsca
     boolean split = false;                 // true = podzial po rowno miedzy villagerow (po jednej wymianie), false = shift (wszystko naraz)
     int startAvail = -1, lastAvail = -1, stall;
@@ -182,7 +184,7 @@ public class ArbuzBot implements ClientModInitializer {
             case AIM_CHEST -> {
                 if (p.getInventory().count(Items.MELON) >= MELON_TARGET) {
                     msg("Mam juz 5 stakow arbuzow w eq.");
-                    homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0; vPos = 0; attempts = 0; blocked = false;
+                    homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0; vPos = 0; attempts = 0; blocked = false; passMade = 0; idlePasses = 0;
                     go(S.HOME_CMD, 10, 30);
                     return;
                 }
@@ -222,7 +224,7 @@ public class ArbuzBot implements ClientModInitializer {
                     }
                 }
                 p.closeHandledScreen();
-                homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0; vPos = 0; attempts = 0; blocked = false;
+                homeName = "Domek #1"; afterHome = S.AIM_V; vIdx = 0; vPos = 0; attempts = 0; blocked = false; passMade = 0; idlePasses = 0;
                 go(S.HOME_CMD, 10, 30);
             }
             case HOME_CMD -> {
@@ -329,6 +331,7 @@ public class ArbuzBot implements ClientModInitializer {
                 TradeOffer o = offers.get(idx);
                 ItemStack buy = o.getDisplayedFirstBuyItem();
                 lastBuy = Math.max(1, buy.getCount());
+                lastBuyG[vIdx] = lastBuy;
                 if (o.isDisabled() && used < quota) blocked = true; // wyprzedany - wroce po restocku
                 // przedmioty wrzucone przez autofill do okienek wymiany tez sie licza (inaczej bot myslal ze nie ma emeraldow)
                 int avail = p.getInventory().count(buy.getItem());
@@ -337,6 +340,7 @@ public class ArbuzBot implements ClientModInitializer {
                 boolean done = o.isDisabled() || used >= quota || avail < buy.getCount() || trades >= 600;
                 if (done) {
                     int made = Math.max(0, (startAvail - avail) / lastBuy);
+                    passMade += made;
                     msg("Villager #" + (vPos + 1) + " (" + (vIdx == 0 ? "eme" : "xp") + "): " + made + " wymian"
                             + (o.isDisabled() ? " (wyprzedany)" : (split && used >= quota) ? " (jego czesc)" : " (koniec towaru)") + ".");
                     p.closeHandledScreen();
@@ -414,19 +418,41 @@ public class ArbuzBot implements ClientModInitializer {
         if (mc.options != null) { mc.options.forwardKey.setPressed(on); if (!on) { mc.options.jumpKey.setPressed(false); mc.options.sprintKey.setPressed(false); } }
     }
 
-    /** Nastepny villager; po ostatniej wymianie sprawdza czy trzeba czekac na restock. */
+    /** Nastepny villager; po ostatnim w grupie decyduje endPass(). */
     void nextVillager() {
-        MinecraftClient mc = MinecraftClient.getInstance();
         vPos++; attempts = 0;
         if (vPos < group().size()) { go(S.AIM_V, 15, 40); return; }
-        if (blocked && mc.player != null && mc.player.getInventory().count(inputItem()) >= lastBuy) {
-            blocked = false; vPos = 0;
+        endPass();
+    }
+
+    boolean hasInput(ClientPlayerEntity p, int g) {
+        return p.getInventory().count(g == 0 ? Items.MELON : Items.EMERALD) >= lastBuyG[g];
+    }
+
+    /**
+     * Koniec przejscia przez grupe villagerow. Jesli w tej grupie zostal towar (wyprzedani), a druga grupa ma co wymieniac,
+     * bot przechodzi do drugiej (eme <-> xp). Gdy obie grupy stoja, czeka na restock. Gdy nic nie zostalo - odklada butelki.
+     */
+    void endPass() {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        ClientPlayerEntity p = mc.player;
+        if (p == null) return;
+        idlePasses = passMade == 0 ? idlePasses + 1 : 0;
+        passMade = 0;
+        int cur = vIdx, other = 1 - vIdx;
+        boolean curHas = hasInput(p, cur), otherHas = hasInput(p, other);
+        if (!curHas && !otherHas) { go(S.AIM_OUT, 15, 40); return; }   // wszystko wymienione
+        int next = otherHas ? other : cur;
+        boolean wait = (next == cur && idlePasses >= 1) || idlePasses >= 2;
+        vIdx = next; vPos = 0; attempts = 0;
+        if (wait) {
+            idlePasses = 0;
             msg("Villagerzy nie sprzedaja - czekam na restock i wracam do pracy. (/arbuz-stop zeby przerwac)");
             go(S.AIM_V, 600, 1200); // sprawdz ponownie za 30-60 s
-            return;
+        } else {
+            if (next != cur) msg("Przechodze do villagerow " + (next == 0 ? "eme (arbuzy)" : "xp (butelki)") + ".");
+            go(S.AIM_V, 15, 40);
         }
-        if (vIdx == 0) { vIdx = 1; vPos = 0; blocked = false; go(S.AIM_V, 15, 40); return; }
-        go(S.AIM_OUT, 15, 40);
     }
 
     /** Czy miedzy mna a villagerem nie ma bloku (zeby nie otwierac przez sciane). */
