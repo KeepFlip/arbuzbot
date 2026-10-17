@@ -135,7 +135,7 @@ public class ArbuzBot implements ClientModInitializer {
                 }
                 webhook = url; save();
                 c.getSource().sendFeedback(Text.literal("[Arbuz] Webhook zapisany. Wysylam wiadomosc testowa..."));
-                post("🤖 Test webhooka", COL_BLUE, null, fld("Status", code("Polaczenie dziala"), false), who(), srv());
+                hookStart(); // wiadomosc testowa w formacie "uruchomiono bota"
                 return 1;
             })));
             d.register(literal("arbuz-webhook-off").executes(c -> { webhook = ""; save(); c.getSource().sendFeedback(Text.literal("[Arbuz] Webhook wylaczony.")); return 1; }));
@@ -157,7 +157,7 @@ public class ArbuzBot implements ClientModInitializer {
                     return 0;
                 }
                 c.getSource().getClient().options.pauseOnLostFocus = false; // bot dziala przy zminimalizowanym oknie
-                paused = false; save();
+                paused = false; save(); cycles = 0; depositedBottles = 0;
                 taken = 0; counted = false;
                 go(S.AIM_CHEST, 10, 30);
                 c.getSource().sendFeedback(Text.literal("[Arbuz] Start. Czekam na 5 stakow arbuzow w skrzynce."));
@@ -641,7 +641,8 @@ public class ArbuzBot implements ClientModInitializer {
 
     String serverName() {
         MinecraftClient mc = MinecraftClient.getInstance();
-        return mc.getCurrentServerEntry() != null ? mc.getCurrentServerEntry().address : "singleplayer";
+        String a = mc.getCurrentServerEntry() != null ? mc.getCurrentServerEntry().address : "singleplayer";
+        return a.isEmpty() ? a : Character.toUpperCase(a.charAt(0)) + a.substring(1);
     }
 
     String who() {
@@ -695,7 +696,7 @@ public class ArbuzBot implements ClientModInitializer {
     /** Zielona: pomyslnie zakupiono przedmiot (po kazdym villagerze). */
     void hookBuy(String item, int qty) {
         post("🛒   Pomyślnie zakupiono przedmiot!", COL_GREEN, null,
-                fld("Przedmiot", code(item), true), fld("Ilość", code(qty + " szt."), true), acct(), who(), srv());
+                fld("Przedmiot", code(item), true), fld("Ilość", code(qty + " szt."), true), fld("Tura nr", code(String.valueOf(cycles + 1)), true), acct(), who(), srv());
     }
 
     /** Niebieska: uruchomienie bota. */
@@ -704,18 +705,18 @@ public class ArbuzBot implements ClientModInitializer {
                 fld("Przedmiot", code("Butelka XP & Emerald"), true), fld("Ilość do zakupienia", code("Nielimitowana"), true), acct(), who(), srv());
     }
 
-    /** Zolta: wylaczenie bota (reason = powod, gdy bot sam sie zatrzymal). */
+    /** Zolta: wylaczenie bota. Powod bledu widac tylko na czacie w grze. */
     void hookStop(String reason) {
-        if (reason == null) post("🤖 Pomyślnie wyłączono bota!", COL_YELLOW, "**Dziękujemy że nasz używasz**", acct(), who(), srv());
-        else post("🤖 Pomyślnie wyłączono bota!", COL_YELLOW, "**Dziękujemy że nasz używasz**", fld("Powód", code(reason), false), acct(), who(), srv());
+        post("🤖 Pomyślnie wyłączono bota!", COL_YELLOW, "**Dziękujemy że nasz używasz**", acct(), who(), srv());
     }
 
     /** Czerwona: bot czeka na villagerow (wyprzedani). */
     void hookWait(ClientPlayerEntity p, int g) {
         int input = p.getInventory().count(g == 0 ? Items.MELON : Items.EMERALD);
         int qty = (input / Math.max(1, lastBuyG[g])) * lastSellG[g];
-        post("⚠️  Oczekiwanie na villagerów!", COL_RED, null,
-                fld("Przedmiot (na który czeka)", code(g == 0 ? "Emeraldy" : "Butelki XP"), true), fld("Ilość", code(qty + " szt."), true), who(), srv());
+        post("⚠️  Pomyślnie zakupiono przedmiot!", COL_RED, null,
+                fld("Przedmiot", code(g == 0 ? "Emeraldy" : "Butelki XP"), true),
+                fld(g == 0 ? "Ilość emeraldów" : "Ilość butelek z xp", code(qty + " szt."), true), who(), srv());
     }
 
     // ================= wstrzymaj / wznow =================
