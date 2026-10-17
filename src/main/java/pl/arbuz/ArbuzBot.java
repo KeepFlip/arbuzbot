@@ -92,6 +92,7 @@ public class ArbuzBot implements ClientModInitializer {
     int mode = 2;                          // co wymieniac: 0 = arbuzy->eme, 1 = eme->xp, 2 = all (jedno i drugie)
     int buyLimit = Integer.MAX_VALUE;      // ile sztuk koncowego przedmiotu kupic (MAX = nielimitowane)
     int boughtTotal; boolean limitReached;
+    int roundBottles, roundEmeralds;       // zakupy w biezacej rundzie (wysylane jedna wiadomoscia na koncu)
     int totalBottles, totalEmeralds;       // laczny zarobek od /arbuz-start (do wiadomosci o wylaczeniu)
     boolean paused;                        // wstrzymany: stan zostaje zachowany i bot wznawia od tego samego miejsca
     boolean split = false;                 // true = podzial po rowno miedzy villagerow (po jednej wymianie), false = shift (wszystko naraz)
@@ -169,7 +170,7 @@ public class ArbuzBot implements ClientModInitializer {
                     return 0;
                 }
                 c.getSource().getClient().options.pauseOnLostFocus = false; // bot dziala przy zminimalizowanym oknie
-                paused = false; save(); cycles = 0; depositedBottles = 0; boughtTotal = 0; limitReached = false; totalBottles = 0; totalEmeralds = 0;
+                paused = false; save(); cycles = 0; depositedBottles = 0; boughtTotal = 0; limitReached = false; totalBottles = 0; totalEmeralds = 0; roundBottles = 0; roundEmeralds = 0;
                 taken = 0; counted = false;
                 go(S.AIM_CHEST, 10, 30);
                 c.getSource().sendFeedback(Text.literal("[Arbuz] Start. Czekam na 5 stakow arbuzow w skrzynce."));
@@ -439,8 +440,8 @@ public class ArbuzBot implements ClientModInitializer {
                     int made = Math.max(0, (startAvail - avail) / lastBuy);
                     passMade += made;
                     if (made > 0) {
-                        if (vIdx == 0) totalEmeralds += made * lastSellG[0]; else totalBottles += made * lastSellG[1];
-                        hookBuy(vIdx == 0 ? "Emeraldy" : "Butelki XP", made * lastSellG[vIdx]);
+                        if (vIdx == 0) { totalEmeralds += made * lastSellG[0]; roundEmeralds += made * lastSellG[0]; }
+                        else { totalBottles += made * lastSellG[1]; roundBottles += made * lastSellG[1]; }
                     }
                     msg("Villager #" + (vPos + 1) + " (" + (vIdx == 0 ? "eme" : "xp") + "): " + made + " wymian"
                             + (o.isDisabled() ? " (wyprzedany)" : (split && used >= quota) ? " (jego czesc)" : " (koniec towaru)") + ".");
@@ -531,6 +532,7 @@ public class ArbuzBot implements ClientModInitializer {
 
     /** Po wszystkim: tryby z butelkami odkladaja je do skrzynki, tryb "arbuz" idzie od razu na /home. */
     void finishTrading() {
+        flushBuy();
         if (mode == 0) { homeName = "Domek #2"; afterHome = S.DONE; go(S.HOME_CMD, 15, 40); }
         else go(S.AIM_OUT, 15, 40);
     }
@@ -765,9 +767,20 @@ public class ArbuzBot implements ClientModInitializer {
     }
 
     /** Zielona: pomyslnie zakupiono przedmiot (po kazdym villagerze). */
-    void hookBuy(String item, int qty) {
+    void hookBuy(String item, String qty) {
         post("🛒   Pomyślnie zakupiono przedmiot!", COL_GREEN, null,
-                fld("Przedmiot", code(item), true), fld("Ilość", code(qty + " szt."), true), acct(), who(), srv());
+                fld("Przedmiot", code(item), true), fld("Ilość", code(qty), true), acct(), who(), srv());
+    }
+
+    /** Zielona: jedna wiadomosc po zakonczeniu calej rundy (po ostatnim villagerze). */
+    void flushBuy() {
+        if (roundEmeralds <= 0 && roundBottles <= 0) return;
+        String item, qty;
+        if (roundEmeralds > 0 && roundBottles > 0) { item = "Emeraldy & Butelki XP"; qty = roundEmeralds + " emeraldów, " + roundBottles + " butelek"; }
+        else if (roundEmeralds > 0) { item = "Emeraldy"; qty = roundEmeralds + " szt."; }
+        else { item = "Butelki XP"; qty = roundBottles + " szt."; }
+        hookBuy(item, qty);
+        roundEmeralds = 0; roundBottles = 0;
     }
 
     /** Niebieska: uruchomienie bota. */
