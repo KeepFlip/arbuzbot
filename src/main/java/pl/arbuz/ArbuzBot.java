@@ -4,6 +4,7 @@ import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.fabricmc.loader.api.FabricLoader;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
@@ -21,6 +22,11 @@ import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.network.packet.c2s.play.SelectMerchantTradeC2SPacket;
+import net.minecraft.scoreboard.Scoreboard;
+import net.minecraft.scoreboard.ScoreboardDisplaySlot;
+import net.minecraft.scoreboard.ScoreboardEntry;
+import net.minecraft.scoreboard.ScoreboardObjective;
+import net.minecraft.scoreboard.Team;
 import net.minecraft.screen.GenericContainerScreenHandler;
 import net.minecraft.screen.MerchantScreenHandler;
 import net.minecraft.screen.ScreenHandler;
@@ -57,6 +63,7 @@ import java.util.List;
 import java.util.Properties;
 import java.util.Random;
 import java.util.UUID;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.argument;
@@ -79,6 +86,8 @@ public class ArbuzBot implements ClientModInitializer {
     final int[] lastBuyG = {1, 1};         // ile sztuk kosztuje wymiana (0 = arbuzy->eme, 1 = eme->xp)
     String webhook = "";                   // adres webhooka Discord (puste = wylaczone)
     int depositedBottles, cycles;
+    final int[] lastSellG = {1, 1};        // ile sztuk daje jedna wymiana
+    String lastChatBalance;                // saldo wylapane z czatu (jesli serwer je wypisuje)
     static final HttpClient HTTP = HttpClient.newHttpClient();
     boolean paused;                        // wstrzymany: stan zostaje zachowany i bot wznawia od tego samego miejsca
     boolean split = false;                 // true = podzial po rowno miedzy villagerow (po jednej wymianie), false = shift (wszystko naraz)
@@ -102,6 +111,10 @@ public class ArbuzBot implements ClientModInitializer {
     public void onInitializeClient() {
         load();
         ClientTickEvents.END_CLIENT_TICK.register(this::tick);
+        ClientReceiveMessageEvents.GAME.register((msg, overlay) -> {
+            Matcher m = CHAT_BAL.matcher(msg.getString());
+            if (m.find()) lastChatBalance = m.group(2).trim() + "$";
+        });
         ClientCommandRegistrationCallback.EVENT.register((d, reg) -> {
             d.register(literal("arbuz-skrzynia").executes(c -> setBlock(c, 0)));
             d.register(literal("arbuz-skrzynia-odluz").executes(c -> setBlock(c, 1)));
@@ -122,7 +135,7 @@ public class ArbuzBot implements ClientModInitializer {
                 }
                 webhook = url; save();
                 c.getSource().sendFeedback(Text.literal("[Arbuz] Webhook zapisany. Wysylam wiadomosc testowa..."));
-                hook("Test webhooka", 5793266, "Status", "Polaczenie dziala");
+                post("🤖 Test webhooka", COL_BLUE, null, fld("Status", code("Polaczenie dziala"), false), who(), srv());
                 return 1;
             })));
             d.register(literal("arbuz-webhook-off").executes(c -> { webhook = ""; save(); c.getSource().sendFeedback(Text.literal("[Arbuz] Webhook wylaczony.")); return 1; }));
@@ -148,10 +161,10 @@ public class ArbuzBot implements ClientModInitializer {
                 taken = 0; counted = false;
                 go(S.AIM_CHEST, 10, 30);
                 c.getSource().sendFeedback(Text.literal("[Arbuz] Start. Czekam na 5 stakow arbuzow w skrzynce."));
-                hook("Bot uruchomiony", 5763719, "Tryb wymiany", split ? "podzial po rowno" : "wszystko naraz (shift)", "Villagerzy", "eme: " + vEme.size() + ", xp: " + vXp.size());
+                hookStart();
                 return 1;
             }));
-            d.register(literal("arbuz-stop").executes(c -> { s = S.IDLE; paused = false; save(); walk(false); c.getSource().sendFeedback(Text.literal("[Arbuz] Stop.")); return 1; }));
+            d.register(literal("arbuz-stop").executes(c -> { boolean was = s != S.IDLE; s = S.IDLE; paused = false; save(); walk(false); if (was) hookStop(null); c.getSource().sendFeedback(Text.literal("[Arbuz] Stop.")); return 1; }));
         });
     }
 
@@ -274,8 +287,6 @@ public class ArbuzBot implements ClientModInitializer {
                         // jestem na Domek #2 - bot dziala dalej: wraca do skrzynki z arbuzami i czeka na kolejna ture
                         msg("Jestem na " + homeName + " - czekam na kolejne arbuzy.");
                         cycles++;
-                        hook("Tura zakonczona", 5763719, "Tura nr", cycles + "", "Odlozone butelki XP", depositedBottles + " szt.",
-                                "Arbuzy w eq", p.getInventory().count(Items.MELON) + "", "Emeraldy w eq", p.getInventory().count(Items.EMERALD) + "");
                         depositedBottles = 0;
                         taken = 0; counted = false;
                         go(S.AIM_CHEST, 40, 90);
@@ -358,6 +369,7 @@ public class ArbuzBot implements ClientModInitializer {
                 ItemStack buy = o.getDisplayedFirstBuyItem();
                 lastBuy = Math.max(1, buy.getCount());
                 lastBuyG[vIdx] = lastBuy;
+                lastSellG[vIdx] = Math.max(1, o.getSellItem().getCount());
                 if (o.isDisabled() && used < quota) blocked = true; // wyprzedany - wroce po restocku
                 // przedmioty wrzucone przez autofill do okienek wymiany tez sie licza (inaczej bot myslal ze nie ma emeraldow)
                 int avail = p.getInventory().count(buy.getItem());
@@ -367,6 +379,7 @@ public class ArbuzBot implements ClientModInitializer {
                 if (done) {
                     int made = Math.max(0, (startAvail - avail) / lastBuy);
                     passMade += made;
+                    if (made > 0) hookBuy(vIdx == 0 ? "Emeraldy" : "Butelki XP", made * lastSellG[vIdx]);
                     msg("Villager #" + (vPos + 1) + " (" + (vIdx == 0 ? "eme" : "xp") + "): " + made + " wymian"
                             + (o.isDisabled() ? " (wyprzedany)" : (split && used >= quota) ? " (jego czesc)" : " (koniec towaru)") + ".");
                     p.closeHandledScreen();
@@ -429,7 +442,7 @@ public class ArbuzBot implements ClientModInitializer {
         jitter = new Vec3d((R.nextDouble() - .5) * .5, (R.nextDouble() - .5) * .5, (R.nextDouble() - .5) * .5);
     }
 
-    void fail(String m) { s = S.IDLE; walk(false); msg("BLAD: " + m); hook("Blad - bot zatrzymany", 15548997, "Powod", m); }
+    void fail(String m) { s = S.IDLE; walk(false); msg("BLAD: " + m); hookStop(m); }
 
     void msg(String m) {
         MinecraftClient mc = MinecraftClient.getInstance();
@@ -475,7 +488,7 @@ public class ArbuzBot implements ClientModInitializer {
         if (wait) {
             idlePasses = 0;
             msg("Villagerzy nie sprzedaja - czekam na restock i wracam do pracy. (/arbuz-stop zeby przerwac)");
-            hook("Czekam na restock villagerow", 16705372, "Arbuzy w eq", p.getInventory().count(Items.MELON) + "", "Emeraldy w eq", p.getInventory().count(Items.EMERALD) + "");
+            hookWait(p, next);
             go(S.AIM_V, 600, 1200); // sprawdz ponownie za 30-60 s
         } else {
             if (next != cur) msg("Przechodze do villagerow " + (next == 0 ? "eme (arbuzy)" : "xp (butelki)") + ".");
@@ -613,25 +626,96 @@ public class ArbuzBot implements ClientModInitializer {
         return b.toString();
     }
 
-    /** Wysyla embed na webhook Discorda (asynchronicznie). kv = pary: nazwa pola, wartosc. */
-    void hook(String title, int color, String... kv) {
-        if (webhook == null || webhook.isBlank()) return;
+    // --- wiadomosci Discord (NK-Arbuz) ---
+    static final int COL_GREEN = 5763719, COL_BLUE = 3447003, COL_YELLOW = 16705372, COL_RED = 15548997;
+    static final Pattern MONEY1 = Pattern.compile("(\\d[\\d\\s.,]*\\s?[kKmMbB]?)\\s*\\$");
+    static final Pattern MONEY2 = Pattern.compile("\\$\\s*(\\d[\\d\\s.,]*[kKmMbB]?)");
+    static final Pattern MONEY_KEY = Pattern.compile("(?i)(pieni|monet|stan konta|saldo|balance|kasa|portfel|money)");
+    static final Pattern CHAT_BAL = Pattern.compile("(?i)(pieni[aą]dze|saldo|stan konta|balance|portfel)\\D{0,20}(\\d[\\d\\s.,]*[kKmMbB]?)");
+
+    String fld(String name, String value, boolean inline) {
+        return "{\"name\":\"" + esc(name) + "\",\"value\":\"" + esc(value) + "\",\"inline\":" + inline + "}";
+    }
+
+    String code(String v) { return "`" + v + "`"; }
+
+    String serverName() {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        return mc.getCurrentServerEntry() != null ? mc.getCurrentServerEntry().address : "singleplayer";
+    }
+
+    String who() {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        return fld("Gracz", code(mc.getSession() != null ? mc.getSession().getUsername() : "?"), false);
+    }
+
+    String srv() { return fld("Serwer", code(serverName()), false); }
+
+    String acct() { return fld("Stan konta", code(balance()), false); }
+
+    /** Stan konta: z tablicy wynikow (scoreboard) po prawej, a jak jej nie ma - z ostatniej wiadomosci na czacie. */
+    String balance() {
         try {
             MinecraftClient mc = MinecraftClient.getInstance();
-            String server = mc.getCurrentServerEntry() != null ? mc.getCurrentServerEntry().address : "singleplayer";
-            String user = mc.getSession() != null ? mc.getSession().getUsername() : "?";
-            StringBuilder fields = new StringBuilder();
-            for (int i = 0; i + 1 < kv.length; i += 2)
-                fields.append("{\"name\":\"").append(esc(kv[i])).append("\",\"value\":\"").append(esc(kv[i + 1])).append("\",\"inline\":true},");
-            fields.append("{\"name\":\"Gracz\",\"value\":\"").append(esc(user)).append("\",\"inline\":true},");
-            fields.append("{\"name\":\"Serwer\",\"value\":\"").append(esc(server)).append("\",\"inline\":true}");
-            String json = "{\"username\":\"ArbuzBot\",\"embeds\":[{\"title\":\"" + esc(title) + "\",\"color\":" + color
-                    + ",\"fields\":[" + fields + "],\"footer\":{\"text\":\"ArbuzBot\"},\"timestamp\":\"" + Instant.now() + "\"}]}";
+            if (mc.world != null) {
+                Scoreboard sb = mc.world.getScoreboard();
+                ScoreboardObjective obj = sb.getObjectiveForSlot(ScoreboardDisplaySlot.SIDEBAR);
+                if (obj != null) {
+                    String fallback = null;
+                    for (ScoreboardEntry e : sb.getScoreboardEntries(obj)) {
+                        Team team = sb.getScoreHolderTeam(e.owner());
+                        String line = Team.decorateName(team, e.name()).getString();
+                        Matcher m = MONEY1.matcher(line);
+                        if (!m.find()) { m = MONEY2.matcher(line); if (!m.find()) continue; }
+                        String val = m.group(1).trim() + "$";
+                        if (MONEY_KEY.matcher(line).find()) return val;
+                        if (fallback == null) fallback = val;
+                    }
+                    if (fallback != null) return fallback;
+                }
+            }
+        } catch (Exception ignored) {}
+        return lastChatBalance != null ? lastChatBalance : "Brak danych";
+    }
+
+    /** Wysyla embed na webhook (asynchronicznie). fields = gotowe fragmenty JSON z fld(). */
+    void post(String title, int color, String description, String... fields) {
+        if (webhook == null || webhook.isBlank()) return;
+        try {
+            String json = "{\"username\":\"NK-Arbuz\",\"embeds\":[{\"title\":\"" + esc(title) + "\",\"color\":" + color
+                    + (description != null ? ",\"description\":\"" + esc(description) + "\"" : "")
+                    + ",\"fields\":[" + String.join(",", fields) + "],\"footer\":{\"text\":\"NK-Arbuz\"}}]}";
             HttpRequest req = HttpRequest.newBuilder(URI.create(webhook))
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(json)).build();
             HTTP.sendAsync(req, HttpResponse.BodyHandlers.discarding());
         } catch (Exception ignored) {}
+    }
+
+    /** Zielona: pomyslnie zakupiono przedmiot (po kazdym villagerze). */
+    void hookBuy(String item, int qty) {
+        post("🛒   Pomyślnie zakupiono przedmiot!", COL_GREEN, null,
+                fld("Przedmiot", code(item), true), fld("Ilość", code(qty + " szt."), true), acct(), who(), srv());
+    }
+
+    /** Niebieska: uruchomienie bota. */
+    void hookStart() {
+        post("🤖 Pomyślnie uruchomiono bota!", COL_BLUE, null,
+                fld("Przedmiot", code("Butelka XP & Emerald"), true), fld("Ilość do zakupienia", code("Nielimitowana"), true), acct(), who(), srv());
+    }
+
+    /** Zolta: wylaczenie bota (reason = powod, gdy bot sam sie zatrzymal). */
+    void hookStop(String reason) {
+        if (reason == null) post("🤖 Pomyślnie wyłączono bota!", COL_YELLOW, "**Dziękujemy że nasz używasz**", acct(), who(), srv());
+        else post("🤖 Pomyślnie wyłączono bota!", COL_YELLOW, "**Dziękujemy że nasz używasz**", fld("Powód", code(reason), false), acct(), who(), srv());
+    }
+
+    /** Czerwona: bot czeka na villagerow (wyprzedani). */
+    void hookWait(ClientPlayerEntity p, int g) {
+        int input = p.getInventory().count(g == 0 ? Items.MELON : Items.EMERALD);
+        int qty = (input / Math.max(1, lastBuyG[g])) * lastSellG[g];
+        post("⚠️  Oczekiwanie na villagerów!", COL_RED, null,
+                fld("Przedmiot (na który czeka)", code(g == 0 ? "Emeraldy" : "Butelki XP"), true), fld("Ilość", code(qty + " szt."), true), who(), srv());
     }
 
     // ================= wstrzymaj / wznow =================
@@ -654,7 +738,6 @@ public class ArbuzBot implements ClientModInitializer {
         paused = true;
         save();
         msg("Wstrzymano (krok: " + s + "). Postep zapisany - /arbuz-startuj wznawia od tego miejsca.");
-        hook("Bot wstrzymany", 16705372, "Krok", s.name());
     }
 
     void resumeBot(MinecraftClient mc) {
@@ -668,7 +751,6 @@ public class ArbuzBot implements ClientModInitializer {
         S next = s;
         go(next, 10, 30);
         msg("Wznowiono od kroku " + next + ".");
-        hook("Bot wznowiony", 5763719, "Krok", next.name());
     }
 
     // ================= ucieczka + anty-logout =================
@@ -678,14 +760,6 @@ public class ArbuzBot implements ClientModInitializer {
         fleeLeft = antiSec * 20 + 20; fleeRecalc = 0; fleeDir = null; path = null;
         s = S.FLEE;
         msg("Dostalem obrazenia - ucieka. Po " + antiSec + " s bez trafienia wyloguje sie.");
-        String who = "nieznany";
-        double bd = 16;
-        for (PlayerEntity o : mc.world.getPlayers()) {
-            if (o == p) continue;
-            double d = o.getPos().distanceTo(p.getPos());
-            if (d < bd) { bd = d; who = o.getName().getString(); }
-        }
-        hook("Zostalem trafiony - uciekam!", 15548997, "Najblizszy gracz", who, "HP", String.format("%.1f", p.getHealth()), "Wylogowanie za", antiSec + " s");
     }
 
     void flee(MinecraftClient mc, ClientPlayerEntity p) {
@@ -693,7 +767,7 @@ public class ArbuzBot implements ClientModInitializer {
         if (--fleeLeft <= 0) {
             walk(false);
             msg("Koniec anty-logout - wylogowuje.");
-            hook("Wylogowano z serwera (koniec anty-logout)", 16705372, "Anty-logout", antiSec + " s");
+            hookStop("Koniec anty-logout - wylogowano z serwera");
             s = S.IDLE;
             if (mc.getNetworkHandler() != null)
                 mc.getNetworkHandler().getConnection().disconnect(Text.literal("[ArbuzBot] Koniec anty-logout - wylogowano."));
