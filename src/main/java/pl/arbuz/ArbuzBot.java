@@ -698,7 +698,7 @@ public class ArbuzBot implements ClientModInitializer {
     }
 
     // --- wiadomosci Discord (NK-Arbuz) ---
-    static final int COL_GREEN = 5763719, COL_DARK = 2964291, COL_YELLOW = 16705372, COL_RED = 15548997;
+    static final int COL_GREEN = 5763719, COL_YELLOW = 16705372, COL_RED = 15548997;
     static final Pattern MONEY1 = Pattern.compile("(\\d[\\d\\s.,]*\\s?[kKmMbB]?)\\s*\\$");
     static final Pattern MONEY2 = Pattern.compile("\\$\\s*(\\d[\\d\\s.,]*[kKmMbB]?)");
     static final Pattern MONEY_KEY = Pattern.compile("(?i)(pieni|monet|stan konta|saldo|balance|kasa|portfel|money)");
@@ -787,7 +787,7 @@ public class ArbuzBot implements ClientModInitializer {
     void hookStart() {
         String item = mode == 0 ? "Emerald" : mode == 1 ? "Butelka XP" : "Butelka XP & Emerald";
         String qty = buyLimit == Integer.MAX_VALUE ? "Nielimitowana" : buyLimit + " szt.";
-        post("🤖 Pomyślnie uruchomiono bota!", COL_DARK, null,
+        post("🤖 Pomyślnie uruchomiono bota!", COL_GREEN, null,
                 fld("Przedmiot", code(item), true), fld("Ilość do zakupienia", code(qty), true), acct(), who(), srv());
     }
 
