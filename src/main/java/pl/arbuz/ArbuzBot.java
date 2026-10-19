@@ -12,6 +12,8 @@ import com.mojang.brigadier.context.CommandContext;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.block.BlockState;
+import net.minecraft.component.DataComponentTypes;
+import net.minecraft.component.type.FoodComponent;
 import net.minecraft.block.Blocks;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.Entity;
@@ -99,6 +101,10 @@ public class ArbuzBot implements ClientModInitializer {
     int lastBottles = -1, depStall;
     boolean debug;                         // true = powod zatrzymania bota widac tez w wiadomosci na Discordzie
     String lastError = "brak";
+    int eatBelow = 4;                      // je gdy glod < N udek (z 10); 0 = wylaczone
+    boolean eating, noFoodWarned; int eatWait, eatCooldown, eatSwap = -1;
+    static final java.util.Set<Item> BAD_FOOD = java.util.Set.of(Items.ROTTEN_FLESH, Items.SPIDER_EYE, Items.POISONOUS_POTATO,
+            Items.PUFFERFISH, Items.CHICKEN, Items.CHORUS_FRUIT, Items.GOLDEN_APPLE, Items.ENCHANTED_GOLDEN_APPLE, Items.SUSPICIOUS_STEW);
     boolean paused;                        // wstrzymany: stan zostaje zachowany i bot wznawia od tego samego miejsca
     boolean split = false;                 // true = podzial po rowno miedzy villagerow (po jednej wymianie), false = shift (wszystko naraz)
     int startAvail = -1, lastAvail = -1, stall;
@@ -157,6 +163,12 @@ public class ArbuzBot implements ClientModInitializer {
                     .then(argument("ilosc", IntegerArgumentType.integer(1, 1000000)).executes(c -> setLimit(c, IntegerArgumentType.getInteger(c, "ilosc"))))
                     .then(literal("nielimitowane").executes(c -> setLimit(c, Integer.MAX_VALUE)))
                     .then(literal("nielimitowana").executes(c -> setLimit(c, Integer.MAX_VALUE))));
+            d.register(literal("arbuz-jedzenie").then(argument("udka", IntegerArgumentType.integer(0, 10)).executes(c -> {
+                eatBelow = IntegerArgumentType.getInteger(c, "udka"); save();
+                c.getSource().sendFeedback(Text.literal(eatBelow == 0 ? "[Arbuz] Automatyczne jedzenie wylaczone."
+                        : "[Arbuz] Bot bedzie jadl, gdy glod spadnie ponizej " + eatBelow + " udek (z 10)."));
+                return 1;
+            })));
             d.register(literal("arbuz-debug").executes(c -> {
                 debug = !debug; save();
                 c.getSource().sendFeedback(Text.literal("[Arbuz] Debug: " + (debug ? "WLACZONY (powod zatrzymania bedzie tez na Discordzie)" : "wylaczony")));
@@ -171,7 +183,7 @@ public class ArbuzBot implements ClientModInitializer {
             }));
             d.register(literal("arbuz-status").executes(c -> {
                 c.getSource().sendFeedback(Text.literal("[Arbuz] skrzynia: " + (chest != null) + ", odluz: " + (outChest != null)
-                        + ", villagerzy eme: " + vEme.size() + ", villagerzy xp: " + vXp.size() + ", przedmiot: " + (mode == 0 ? "arbuz" : mode == 1 ? "xp" : "all") + ", ilosc: " + limitName() + ", webhook: " + (webhook.isEmpty() ? "wylaczony" : "wlaczony") + ", wstrzymany: " + paused + ", ostatni blad: " + lastError + ", podzial: " + split + ", anty-logout: " + antiSec + " s, stan: " + s));
+                        + ", villagerzy eme: " + vEme.size() + ", villagerzy xp: " + vXp.size() + ", przedmiot: " + (mode == 0 ? "arbuz" : mode == 1 ? "xp" : "all") + ", ilosc: " + limitName() + ", webhook: " + (webhook.isEmpty() ? "wylaczony" : "wlaczony") + ", jedzenie ponizej: " + (eatBelow == 0 ? "wylaczone" : eatBelow + " udek") + ", wstrzymany: " + paused + ", ostatni blad: " + lastError + ", podzial: " + split + ", anty-logout: " + antiSec + " s, stan: " + s));
                 return 1;
             }));
             d.register(literal("arbuz-start").executes(c -> {
@@ -276,6 +288,7 @@ public class ArbuzBot implements ClientModInitializer {
         nullTicks = 0;
         if (s == S.FLEE) { flee(mc, p); return; }
         if (p.hurtTime > 0) { startFlee(mc, p); return; }
+        if (tryEat(mc, p)) return;
         if (delay > 0) { delay--; return; }
         if (++waited > 800) { fail("Timeout w kroku " + s); return; }
 
@@ -550,7 +563,7 @@ public class ArbuzBot implements ClientModInitializer {
 
     void walk(boolean on) {
         MinecraftClient mc = MinecraftClient.getInstance();
-        if (mc.options != null) { mc.options.forwardKey.setPressed(on); if (!on) { mc.options.jumpKey.setPressed(false); mc.options.sprintKey.setPressed(false); } }
+        if (mc.options != null) { mc.options.forwardKey.setPressed(on); if (!on) { mc.options.jumpKey.setPressed(false); mc.options.sprintKey.setPressed(false); mc.options.useKey.setPressed(false); } }
     }
 
     /** Nastepny villager; po ostatnim w grupie decyduje endPass(). */
@@ -718,6 +731,50 @@ public class ArbuzBot implements ClientModInitializer {
         if (speed < 0.03) stuckTicks++; else stuckTicks = 0;
         if (stuckTicks > 40) { path = null; stuckTicks = 0; if (++repaths > 3) navFail = true; }
         return false;
+    }
+
+    // ================= automatyczne jedzenie =================
+    int findFood(ClientPlayerEntity p) {
+        int best = -1, bestN = -1;
+        for (int i = 0; i < 36; i++) {
+            ItemStack st = p.getInventory().getStack(i);
+            if (st.isEmpty() || BAD_FOOD.contains(st.getItem())) continue;
+            FoodComponent fc = st.get(DataComponentTypes.FOOD);
+            if (fc != null && fc.nutrition() > bestN) { bestN = fc.nutrition(); best = i; }
+        }
+        return best;
+    }
+
+    /** Je, gdy glod spadnie ponizej progu. Zwraca true, gdy wlasnie je (reszta bota czeka). */
+    boolean tryEat(MinecraftClient mc, ClientPlayerEntity p) {
+        if (eatBelow <= 0) return false;
+        if (eating) {
+            if (p.isUsingItem()) { eatWait = 0; walk(false); mc.options.useKey.setPressed(true); return true; }
+            if (++eatWait < 6) return true;
+            mc.options.useKey.setPressed(false);
+            eating = false;
+            if (eatSwap >= 9) mc.interactionManager.clickSlot(p.playerScreenHandler.syncId, eatSwap, p.getInventory().selectedSlot, SlotActionType.SWAP, p);
+            eatSwap = -1;
+            return false;
+        }
+        if (eatCooldown > 0) { eatCooldown--; return false; }
+        if (p.currentScreenHandler != p.playerScreenHandler) return false;   // nie podczas otwartego okna
+        if (p.getHungerManager().getFoodLevel() >= eatBelow * 2) return false;
+        int slot = findFood(p);
+        if (slot < 0) {
+            if (!noFoodWarned) { msg("Jestem glodny, a w eq nie ma jedzenia!"); noFoodWarned = true; }
+            eatCooldown = 600;
+            return false;
+        }
+        noFoodWarned = false;
+        walk(false);
+        if (slot < 9) { p.getInventory().selectedSlot = slot; eatSwap = -1; }
+        else { mc.interactionManager.clickSlot(p.playerScreenHandler.syncId, slot, p.getInventory().selectedSlot, SlotActionType.SWAP, p); eatSwap = slot; }
+        mc.interactionManager.interactItem(p, Hand.MAIN_HAND);
+        mc.options.useKey.setPressed(true);
+        eating = true; eatWait = 0;
+        msg("Jem (glod: " + p.getHungerManager().getFoodLevel() + "/20).");
+        return true;
     }
 
     // ================= webhook Discord =================
@@ -1037,6 +1094,7 @@ public class ArbuzBot implements ClientModInitializer {
             pr.setProperty("webhook", webhook);
             pr.setProperty("mode", mode + "");
             pr.setProperty("debug", debug + "");
+            pr.setProperty("eat", eatBelow + "");
             pr.setProperty("totBottles", totalBottles + "");
             pr.setProperty("totEmeralds", totalEmeralds + "");
             pr.setProperty("limit", buyLimit + "");
@@ -1081,6 +1139,7 @@ public class ArbuzBot implements ClientModInitializer {
             webhook = pr.getProperty("webhook", "");
             mode = Integer.parseInt(pr.getProperty("mode", "2"));
             debug = Boolean.parseBoolean(pr.getProperty("debug", "false"));
+            eatBelow = Integer.parseInt(pr.getProperty("eat", "4"));
             totalBottles = Integer.parseInt(pr.getProperty("totBottles", "0"));
             totalEmeralds = Integer.parseInt(pr.getProperty("totEmeralds", "0"));
             buyLimit = Integer.parseInt(pr.getProperty("limit", Integer.MAX_VALUE + ""));
